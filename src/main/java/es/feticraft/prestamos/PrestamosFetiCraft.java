@@ -21,10 +21,12 @@ import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.event.inventory.InventoryOpenEvent;
 import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
+import org.bukkit.event.player.PlayerItemBreakEvent;
 import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
+import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.RegisteredServiceProvider;
@@ -81,10 +83,8 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         }
         getCommand("prestamos").setExecutor(this);
         
-        // 1. Cronómetro de caducidad global cada segundo
         Bukkit.getScheduler().runTaskTimer(this, this::processAllExpiredRentals, 20L, 20L);
         
-        // 2. Limpieza continua cada 3 segundos para barrer inventarios que cambian entre mundos
         Bukkit.getScheduler().runTaskTimer(this, () -> {
             for (Player p : Bukkit.getOnlinePlayers()) {
                 cleanExpiredItemsFromPlayer(p, false);
@@ -986,7 +986,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         if (event.getView().getTitle().equals(color(CONFIRM_TITLE))) pendingListings.remove(event.getPlayer().getUniqueId());
     }
 
-    // BARRIDO AL CAMBIAR DE MUNDO (Lobby -> Survival)
     @EventHandler
     public void onChangeWorld(PlayerChangedWorldEvent event) {
         Player player = event.getPlayer();
@@ -995,7 +994,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         }, 5L);
     }
 
-    // BARRIDO AL ABRIR CUALQUIER INVENTARIO / COFRE
     @EventHandler
     public void onInventoryOpen(InventoryOpenEvent event) {
         if (event.getPlayer() instanceof Player player) {
@@ -1049,6 +1047,65 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
     public void onPickup(EntityPickupItemEvent event) {
         if (hasRentalMarker(event.getItem().getItemStack()) && event.getEntity() instanceof Player player) {
             event.setCancelled(true);
+        }
+    }
+
+    // NUEVO: DETECTAR CUANDO SE ROMPE UN OBJETO ALQUILADO
+    @EventHandler
+    public void onItemBreak(PlayerItemBreakEvent event) {
+        ItemStack broken = event.getItemsBreak(); // En algunas versiones es event.getItem()
+        // Nota de compatibilidad: Usamos event.getItem() o la revisión segura del item roto
+        handleItemBreak(event.getPlayer(), broken);
+    }
+
+    private void handleItemBreak(Player player, ItemStack item) {
+        if (!hasRentalMarker(item)) return;
+        String rentalId = item.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+        if (rentalId == null) return;
+
+        // Forzar la devolución inmediata a la base de datos como si hubiera expirado
+        try {
+            String listingId; String ownerUuid;
+            try (PreparedStatement ps = database.prepareStatement("SELECT listing_id, owner_uuid FROM rentals WHERE id=? AND renter_uuid=? AND status='ACTIVE'")) {
+                ps.setString(1, rentalId);
+                ps.setString(2, player.getUniqueId().toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next()) return;
+                    listingId = rs.getString("listing_id");
+                    ownerUuid = rs.getString("owner_uuid");
+                }
+            }
+
+            // Limpiar marca y clonar item roto (o guardarlo tal cual)
+            ItemStack cleanItem = item.clone();
+            ItemMeta meta = cleanItem.getItemMeta();
+            if (meta != null) {
+                meta.getPersistentDataContainer().remove(rentalKey);
+                cleanItem.setItemMeta(meta);
+            }
+            byte[] data = serializeItem(cleanItem);
+            long now = System.currentTimeMillis();
+
+            database.setAutoCommit(false);
+            try (PreparedStatement ps = database.prepareStatement("INSERT INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+                ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid); ps.setString(4, player.getUniqueId().toString()); ps.setBytes(5, data); ps.setLong(6, now); ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='EXPIRED' WHERE id=? AND status='ACTIVE'")) {
+                ps.setString(1, rentalId); ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=? WHERE id=? AND status='RENTED'")) {
+                ps.setLong(1, now); ps.setString(2, listingId); ps.executeUpdate();
+            }
+            database.commit(); database.setAutoCommit(true);
+
+            message(player, "&c¡Has roto la herramienta alquilada! Se ha devuelto automáticamente al propietario.");
+            Player owner = Bukkit.getPlayer(UUID.fromString(ownerUuid));
+            if (owner != null) {
+                message(owner, "&cEl jugador que alquiló tu herramienta la ha roto. Está disponible en Mis devoluciones.");
+            }
+        } catch (Exception e) {
+            try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+            getLogger().warning("Error procesando objeto alquilado roto: " + e.getMessage());
         }
     }
 
