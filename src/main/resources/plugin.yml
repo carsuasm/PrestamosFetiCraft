@@ -1,0 +1,23 @@
+
+name: PrestamosFetiCraft
+version: 0.1.0
+main: es.feticraft.prestamos.PrestamosFetiCraft
+api-version: '26.3'
+description: Sistema de préstamos de objetos de FetiCraft
+author: FetiCraft
+depend:
+  - Vault
+
+commands:
+  prestamos:
+    description: Abre el menú de préstamos
+    usage: /prestamos
+    permission: prestamos.use
+
+permissions:
+  prestamos.use:
+    description: Permite abrir el menú de préstamos
+    default: true
+  prestamos.admin:
+    description: Permite usar herramientas administrativas
+    default: op
