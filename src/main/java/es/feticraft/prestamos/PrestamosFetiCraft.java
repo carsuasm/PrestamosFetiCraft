@@ -18,6 +18,8 @@ import org.bukkit.event.entity.PlayerDeathEvent;
 import org.bukkit.event.inventory.InventoryClickEvent;
 import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
+import org.bukkit.event.inventory.InventoryOpenEvent;
+import org.bukkit.event.player.PlayerChangedWorldEvent;
 import org.bukkit.event.player.PlayerDropItemEvent;
 import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
@@ -78,7 +80,17 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             return;
         }
         getCommand("prestamos").setExecutor(this);
+        
+        // 1. Cronómetro de caducidad global cada segundo
         Bukkit.getScheduler().runTaskTimer(this, this::processAllExpiredRentals, 20L, 20L);
+        
+        // 2. Limpieza continua cada 3 segundos para barrer inventarios que cambian entre mundos
+        Bukkit.getScheduler().runTaskTimer(this, () -> {
+            for (Player p : Bukkit.getOnlinePlayers()) {
+                cleanExpiredItemsFromPlayer(p, false);
+            }
+        }, 60L, 60L);
+
         getLogger().info("Préstamos de FetiCraft iniciado correctamente.");
         getLogger().info("Economía conectada: " + economy.getName());
     }
@@ -829,13 +841,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
 
             Player renterOnline = Bukkit.getPlayer(renterUuid);
             if (renterOnline != null) {
-                for (int i = 0; i < renterOnline.getInventory().getContents().length; i++) {
-                    if (hasRentalId(renterOnline.getInventory().getItem(i), rentalId)) {
-                        renterOnline.getInventory().setItem(i, null);
-                    }
-                }
-                renterOnline.updateInventory();
-                message(renterOnline, "&c¡Tu alquiler ha caducado! El objeto ha sido devuelto al propietario.");
+                cleanExpiredItemsFromPlayer(renterOnline, true);
             }
 
             Player ownerOnline = Bukkit.getPlayer(ownerUuid);
@@ -845,6 +851,27 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         } catch (Exception e) {
             try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
             getLogger().warning("Error procesando caducidad para " + rentalId + ": " + e.getMessage());
+        }
+    }
+
+    private void cleanExpiredItemsFromPlayer(Player player, boolean notify) {
+        boolean changed = false;
+        ItemStack[] contents = player.getInventory().getContents();
+        for (int i = 0; i < contents.length; i++) {
+            ItemStack stack = contents[i];
+            if (stack != null && stack.hasItemMeta()) {
+                String rId = stack.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+                if (rId != null && isRentalExpiredForPlayer(player, rId)) {
+                    player.getInventory().setItem(i, null);
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            player.updateInventory();
+            if (notify) {
+                message(player, "&c¡Tu alquiler ha caducado y el objeto ha sido retirado!");
+            }
         }
     }
 
@@ -959,30 +986,30 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         if (event.getView().getTitle().equals(color(CONFIRM_TITLE))) pendingListings.remove(event.getPlayer().getUniqueId());
     }
 
+    // BARRIDO AL CAMBIAR DE MUNDO (Lobby -> Survival)
+    @EventHandler
+    public void onChangeWorld(PlayerChangedWorldEvent event) {
+        Player player = event.getPlayer();
+        Bukkit.getScheduler().runTaskLater(this, () -> {
+            cleanExpiredItemsFromPlayer(player, true);
+        }, 5L);
+    }
+
+    // BARRIDO AL ABRIR CUALQUIER INVENTARIO / COFRE
+    @EventHandler
+    public void onInventoryOpen(InventoryOpenEvent event) {
+        if (event.getPlayer() instanceof Player player) {
+            cleanExpiredItemsFromPlayer(player, true);
+        }
+    }
+
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
         Player player = event.getPlayer();
-        // Ejecución en 2 ticks diferidos para dar tiempo a plugins como Multiverse-Inventories / PerWorldInventory a cargar sus inventarios antes de barrer
         Bukkit.getScheduler().runTaskLater(this, () -> {
             processAllExpiredRentals();
-            
-            boolean changed = false;
-            ItemStack[] contents = player.getInventory().getContents();
-            for (int i = 0; i < contents.length; i++) {
-                ItemStack stack = contents[i];
-                if (stack != null && stack.hasItemMeta()) {
-                    String rId = stack.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
-                    if (rId != null && isRentalExpiredForPlayer(player, rId)) {
-                        player.getInventory().setItem(i, null);
-                        changed = true;
-                    }
-                }
-            }
-            if (changed) {
-                player.updateInventory();
-                message(player, "&cSe ha retirado un objeto alquilado caducado de tu inventario.");
-            }
-        }, 2L);
+            cleanExpiredItemsFromPlayer(player, true);
+        }, 5L);
     }
 
     @EventHandler
