@@ -1,4 +1,4 @@
-```java
+
 package es.feticraft.prestamos;
 
 import net.milkbowl.vault.economy.Economy;
@@ -254,7 +254,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
             return true;
         }
 
-        if (args.length > 0 && args[0].equalsIgnoreCase("publicar")) {
+        if (args.length > 0
+                && args[0].equalsIgnoreCase("publicar")) {
             if (args.length != 3) {
                 player.sendMessage(color(
                         "&eUso: /prestamos publicar <precio> <minutos>"
@@ -298,15 +299,16 @@ public final class PrestamosFetiCraft extends JavaPlugin
             return;
         }
 
-        if (durationMinutes < 1 ||
-                durationMinutes > MAX_DURATION_MINUTES) {
+        if (durationMinutes < 1
+                || durationMinutes > MAX_DURATION_MINUTES) {
             player.sendMessage(color(
                     "&cLa duración debe estar entre 1 minuto y 30 días."
             ));
             return;
         }
 
-        ItemStack hand = player.getInventory().getItemInMainHand();
+        ItemStack hand =
+                player.getInventory().getItemInMainHand();
 
         if (hand.getType() == Material.AIR || hand.getAmount() <= 0) {
             player.sendMessage(color(
@@ -344,16 +346,12 @@ public final class PrestamosFetiCraft extends JavaPlugin
         long now = System.currentTimeMillis();
         long durationSeconds = durationMinutes * 60L;
 
-        /*
-         * Fase 1:
-         * Guardar el objeto y la operación como recuperación requerida.
-         * El anuncio todavía NO puede alquilarse.
-         */
         try {
             database.setAutoCommit(false);
 
             try {
-                try (PreparedStatement listing = database.prepareStatement("""
+                try (PreparedStatement listing =
+                             database.prepareStatement("""
                     INSERT INTO listings (
                         id, owner_uuid, owner_name, item_data,
                         price, duration_seconds, status,
@@ -362,7 +360,9 @@ public final class PrestamosFetiCraft extends JavaPlugin
                               ?, ?, 0)
                     """)) {
                     listing.setString(1, listingId);
-                    listing.setString(2, player.getUniqueId().toString());
+                    listing.setString(
+                            2, player.getUniqueId().toString()
+                    );
                     listing.setString(3, player.getName());
                     listing.setBytes(4, itemData);
                     listing.setDouble(5, price);
@@ -415,11 +415,6 @@ public final class PrestamosFetiCraft extends JavaPlugin
             return;
         }
 
-        /*
-         * Fase 2:
-         * Retirar exactamente el objeto que se guardó.
-         * El código se ejecuta en el hilo principal de Bukkit.
-         */
         ItemStack currentHand =
                 player.getInventory().getItemInMainHand();
 
@@ -429,7 +424,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
                             + "El anuncio queda bloqueado para revisión."
             ));
             markRecoveryRequired(
-                    operationId, listingId,
+                    operationId,
+                    listingId,
                     "El objeto cambió antes de retirarse del inventario."
             );
             return;
@@ -437,24 +433,21 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
         player.getInventory().setItemInMainHand(null);
 
-        /*
-         * Fase 3:
-         * Solo ahora se activa el anuncio.
-         * Si la base de datos falla, el anuncio permanece bloqueado
-         * y el objeto guardado no se entrega a ningún alquilador.
-         */
         try {
             database.setAutoCommit(false);
 
             try {
-                try (PreparedStatement listing = database.prepareStatement("""
+                try (PreparedStatement listing =
+                             database.prepareStatement("""
                     UPDATE listings
                     SET status = 'AVAILABLE',
                         updated_at = ?,
                         version = version + 1
                     WHERE id = ? AND status = 'RECOVERY_REQUIRED'
                     """)) {
-                    listing.setLong(1, System.currentTimeMillis());
+                    listing.setLong(
+                            1, System.currentTimeMillis()
+                    );
                     listing.setString(2, listingId);
 
                     if (listing.executeUpdate() != 1) {
@@ -475,7 +468,9 @@ public final class PrestamosFetiCraft extends JavaPlugin
                     operation.setString(
                             1, "Objeto guardado y anuncio activado."
                     );
-                    operation.setLong(2, System.currentTimeMillis());
+                    operation.setLong(
+                            2, System.currentTimeMillis()
+                    );
                     operation.setString(3, operationId);
 
                     if (operation.executeUpdate() != 1) {
@@ -504,7 +499,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
             );
 
             markRecoveryRequired(
-                    operationId, listingId,
+                    operationId,
+                    listingId,
                     "Error al confirmar la publicación: "
                             + exception.getMessage()
             );
@@ -545,7 +541,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
     }
 
     private byte[] serializeItem(ItemStack item) throws IOException {
-        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        try (ByteArrayOutputStream bytes =
+                     new ByteArrayOutputStream();
              BukkitObjectOutputStream output =
                      new BukkitObjectOutputStream(bytes)) {
             output.writeObject(item);
@@ -567,14 +564,17 @@ public final class PrestamosFetiCraft extends JavaPlugin
             database.setAutoCommit(false);
 
             try {
-                try (PreparedStatement listing = database.prepareStatement("""
+                try (PreparedStatement listing =
+                             database.prepareStatement("""
                     UPDATE listings
                     SET status = 'RECOVERY_REQUIRED',
                         updated_at = ?,
                         version = version + 1
                     WHERE id = ?
                     """)) {
-                    listing.setLong(1, System.currentTimeMillis());
+                    listing.setLong(
+                            1, System.currentTimeMillis()
+                    );
                     listing.setString(2, listingId);
                     listing.executeUpdate();
                 }
@@ -588,7 +588,9 @@ public final class PrestamosFetiCraft extends JavaPlugin
                     WHERE id = ?
                     """)) {
                     operation.setString(1, details);
-                    operation.setLong(2, System.currentTimeMillis());
+                    operation.setLong(
+                            2, System.currentTimeMillis()
+                    );
                     operation.setString(3, operationId);
                     operation.executeUpdate();
                 }
@@ -618,30 +620,40 @@ public final class PrestamosFetiCraft extends JavaPlugin
                 null, 27, color(MENU_TITLE)
         );
 
-        addButton(inventory, 11, Material.BOOK,
+        addButton(
+                inventory, 11, Material.BOOK,
                 "&bMercado",
                 "Ver objetos disponibles para alquilar.",
-                "market");
+                "market"
+        );
 
-        addButton(inventory, 13, Material.CHEST,
+        addButton(
+                inventory, 13, Material.CHEST,
                 "&aPublicar objeto",
                 "Usa /prestamos publicar <precio> <minutos>.",
-                "publish");
+                "publish"
+        );
 
-        addButton(inventory, 15, Material.CLOCK,
+        addButton(
+                inventory, 15, Material.CLOCK,
                 "&eMis alquileres",
                 "Consultar tus alquileres activos.",
-                "rentals");
+                "rentals"
+        );
 
-        addButton(inventory, 21, Material.HOPPER,
+        addButton(
+                inventory, 21, Material.HOPPER,
                 "&6Mis devoluciones",
                 "Consultar objetos pendientes de recoger.",
-                "returns");
+                "returns"
+        );
 
-        addButton(inventory, 23, Material.WRITABLE_BOOK,
+        addButton(
+                inventory, 23, Material.WRITABLE_BOOK,
                 "&dMis anuncios",
                 "Administrar tus anuncios.",
-                "listings");
+                "listings"
+        );
 
         player.openInventory(inventory);
     }
@@ -692,8 +704,9 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
         int slot = event.getRawSlot();
 
-        if (slot < 0 ||
-                slot >= event.getView().getTopInventory().getSize()) {
+        if (slot < 0
+                || slot >= event.getView()
+                        .getTopInventory().getSize()) {
             return;
         }
 
@@ -773,4 +786,3 @@ public final class PrestamosFetiCraft extends JavaPlugin
         );
     }
 }
-```
