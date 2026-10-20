@@ -444,7 +444,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                         List<String> lore = meta.hasLore() ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
                         lore.add(color("&7Propietario: &f" + rs.getString("owner_name")));
                         lore.add(color("&7Estado: &f" + rs.getString("status")));
-                        long remaining = Math.max(0, (rs.getLong("expires_at") - System.currentTimeMillis()) / 1000L);
+                        long remaining = Math.max(0, (rs.getLong("expires_at") - System.currentTimeMillis() + 999L) / 1000L);
                         lore.add(color("&7Tiempo restante: &e" + formatDuration(remaining)));
                         item.setItemMeta(meta);
                     }
@@ -489,53 +489,131 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
             message(owner, "&cDeja al menos un espacio libre en tu inventario.");
             return;
         }
+
         String listingId;
         ItemStack item;
         String operationId = UUID.randomUUID().toString();
+        long now = System.currentTimeMillis();
+
+        // Primero reservamos la devolución en SQLite. Mientras esté en RECOVERY_REQUIRED,
+        // no aparecerá como disponible para recogerla otra vez si el servidor se interrumpe.
         try {
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("SELECT listing_id,item_data FROM returns WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
-                ps.setString(1, rentalId); ps.setString(2, owner.getUniqueId().toString());
+            try (PreparedStatement ps = database.prepareStatement(
+                    "SELECT listing_id,item_data FROM returns WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
+                ps.setString(1, rentalId);
+                ps.setString(2, owner.getUniqueId().toString());
                 try (ResultSet rs = ps.executeQuery()) {
-                    if (!rs.next()) { database.rollback(); database.setAutoCommit(true); message(owner, "&cEsta devolución ya no está disponible."); return; }
-                    listingId = rs.getString("listing_id"); item = deserializeItem(rs.getBytes("item_data"));
+                    if (!rs.next()) {
+                        database.rollback();
+                        database.setAutoCommit(true);
+                        message(owner, "&cEsta devolución ya no está disponible o está pendiente de revisión.");
+                        return;
+                    }
+                    listingId = rs.getString("listing_id");
+                    item = deserializeItem(rs.getBytes("item_data"));
                 }
             }
-            try (PreparedStatement ps = database.prepareStatement("INSERT INTO operations(id,operation_type,listing_id,player_uuid,status,details,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")) {
-                long now = System.currentTimeMillis(); ps.setString(1, operationId); ps.setString(2, "CLAIM_RETURN"); ps.setString(3, listingId); ps.setString(4, owner.getUniqueId().toString()); ps.setString(5, "PREPARED"); ps.setString(6, "Recogida de devolución en curso"); ps.setLong(7, now); ps.setLong(8, now); ps.executeUpdate();
+            try (PreparedStatement ps = database.prepareStatement(
+                    "UPDATE returns SET status='RECOVERY_REQUIRED' WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
+                ps.setString(1, rentalId);
+                ps.setString(2, owner.getUniqueId().toString());
+                if (ps.executeUpdate() != 1) {
+                    database.rollback();
+                    database.setAutoCommit(true);
+                    message(owner, "&cOtro proceso está gestionando esta devolución. Vuelve a abrir el menú.");
+                    return;
+                }
             }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE returns SET status='CLAIMED' WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
-                ps.setString(1, rentalId); ps.setString(2, owner.getUniqueId().toString());
-                if (ps.executeUpdate() != 1) { database.rollback(); database.setAutoCommit(true); message(owner, "&cOtro proceso ya ha recogido esta devolución."); return; }
+            try (PreparedStatement ps = database.prepareStatement(
+                    "INSERT INTO operations(id,operation_type,listing_id,player_uuid,status,details,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")) {
+                ps.setString(1, operationId);
+                ps.setString(2, "CLAIM_RETURN");
+                ps.setString(3, listingId);
+                ps.setString(4, owner.getUniqueId().toString());
+                ps.setString(5, "PREPARED");
+                ps.setString(6, "Devolución reservada; entrega en curso");
+                ps.setLong(7, now);
+                ps.setLong(8, now);
+                ps.executeUpdate();
             }
-            database.commit(); database.setAutoCommit(true);
-            // Quitar el marcador antes de devolver el objeto original al dueño.
-            ItemMeta meta = item.getItemMeta();
-            if (meta != null) {
-                meta.getPersistentDataContainer().remove(rentalKey);
-                meta.getPersistentDataContainer().remove(actionKey);
-                item.setItemMeta(meta);
-            }
-            Map<Integer, ItemStack> leftovers = owner.getInventory().addItem(item);
-            if (!leftovers.isEmpty()) {
-                // Intentar dejarlo pendiente si por alguna razón el inventario se llenó justo ahora.
+            database.commit();
+            database.setAutoCommit(true);
+        } catch (Exception e) {
+            try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+            getLogger().severe("No se pudo reservar la devolución " + rentalId + ": " + e.getMessage());
+            message(owner, "&cNo se pudo preparar la devolución. No se ha entregado ningún objeto; vuelve a intentarlo.");
+            return;
+        }
+
+        // Retirar los datos internos del plugin antes de entregar el objeto original.
+        ItemMeta meta = item.getItemMeta();
+        if (meta != null) {
+            meta.getPersistentDataContainer().remove(rentalKey);
+            meta.getPersistentDataContainer().remove(actionKey);
+            item.setItemMeta(meta);
+        }
+
+        Map<Integer, ItemStack> leftovers = owner.getInventory().addItem(item);
+        if (!leftovers.isEmpty()) {
+            // No se ha podido entregar: vuelve a dejar la devolución disponible.
+            try {
                 database.setAutoCommit(false);
-                try (PreparedStatement ps = database.prepareStatement("UPDATE returns SET status='PENDING' WHERE rental_id=? AND status='CLAIMED'")) { ps.setString(1, rentalId); ps.executeUpdate(); }
-                try (PreparedStatement ps = database.prepareStatement("UPDATE operations SET status='FAILED',details=?,updated_at=? WHERE id=?")) { ps.setString(1, "Inventario lleno durante la recogida"); ps.setLong(2, System.currentTimeMillis()); ps.setString(3, operationId); ps.executeUpdate(); }
-                database.commit(); database.setAutoCommit(true);
-                message(owner, "&cInventario lleno; la devolución sigue pendiente.");
-                return;
+                try (PreparedStatement ps = database.prepareStatement(
+                        "UPDATE returns SET status='PENDING' WHERE rental_id=? AND status='RECOVERY_REQUIRED'")) {
+                    ps.setString(1, rentalId);
+                    ps.executeUpdate();
+                }
+                try (PreparedStatement ps = database.prepareStatement(
+                        "UPDATE operations SET status='FAILED',details=?,updated_at=? WHERE id=?")) {
+                    ps.setString(1, "Inventario lleno durante la recogida; devolución reabierta");
+                    ps.setLong(2, System.currentTimeMillis());
+                    ps.setString(3, operationId);
+                    ps.executeUpdate();
+                }
+                database.commit();
+                database.setAutoCommit(true);
+            } catch (SQLException e) {
+                try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+                getLogger().severe("No se pudo reabrir la devolución " + rentalId + ": " + e.getMessage());
             }
+            message(owner, "&cNo se ha podido entregar el objeto. Libera espacio y vuelve a intentarlo.");
+            return;
+        }
+
+        // Solo se marca como recogida después de que Bukkit haya aceptado el objeto.
+        try {
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURNED' WHERE id=?")) { ps.setString(1, rentalId); ps.executeUpdate(); }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='CLAIMED',updated_at=?,version=version+1 WHERE id=?")) { ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate(); }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE operations SET status='COMMITTED',details=?,updated_at=? WHERE id=?")) { ps.setString(1, "Objeto devuelto al propietario"); ps.setLong(2, System.currentTimeMillis()); ps.setString(3, operationId); ps.executeUpdate(); }
-            database.commit(); database.setAutoCommit(true);
+            try (PreparedStatement ps = database.prepareStatement(
+                    "UPDATE returns SET status='CLAIMED' WHERE rental_id=? AND status='RECOVERY_REQUIRED'")) {
+                ps.setString(1, rentalId);
+                if (ps.executeUpdate() != 1) throw new SQLException("La devolución ya no está reservada");
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURNED' WHERE id=?")) {
+                ps.setString(1, rentalId);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement(
+                    "UPDATE listings SET status='CLAIMED',updated_at=?,version=version+1 WHERE id=?")) {
+                ps.setLong(1, System.currentTimeMillis());
+                ps.setString(2, listingId);
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement(
+                    "UPDATE operations SET status='COMMITTED',details=?,updated_at=? WHERE id=?")) {
+                ps.setString(1, "Objeto entregado al propietario y devolución cerrada");
+                ps.setLong(2, System.currentTimeMillis());
+                ps.setString(3, operationId);
+                ps.executeUpdate();
+            }
+            database.commit();
+            database.setAutoCommit(true);
             message(owner, "&aHas recuperado tu objeto devuelto.");
         } catch (Exception e) {
             try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-            getLogger().severe("Error recogiendo devolución " + rentalId + ": " + e.getMessage());
-            message(owner, "&cNo se pudo completar la recogida. Comprueba el estado antes de volver a intentarlo.");
+            // No reabrimos automáticamente: el objeto ya se ha entregado y reabrirla podría duplicarlo.
+            getLogger().severe("El objeto se entregó, pero no se pudo cerrar la devolución " + rentalId + ": " + e.getMessage());
+            message(owner, "&eEl objeto se ha entregado, pero el registro necesita revisión de un administrador. No vuelvas a reclamarlo.");
         }
     }
 
@@ -770,12 +848,15 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
     }
 
     private String formatDuration(long seconds) {
-        long minutes = Math.max(0, seconds / 60L);
-        long days = minutes / 1440L; minutes %= 1440L;
-        long hours = minutes / 60L; minutes %= 60L;
+        seconds = Math.max(0, seconds);
+        long days = seconds / 86400L;
+        long hours = (seconds % 86400L) / 3600L;
+        long minutes = (seconds % 3600L) / 60L;
+        long secs = seconds % 60L;
         if (days > 0) return days + " d " + hours + " h";
         if (hours > 0) return hours + " h " + minutes + " min";
-        return minutes + " min";
+        if (minutes > 0) return minutes + " min " + secs + " s";
+        return secs + " s";
     }
 
     private String money(double amount) { return String.format(java.util.Locale.US, "%.2f$", amount); }
