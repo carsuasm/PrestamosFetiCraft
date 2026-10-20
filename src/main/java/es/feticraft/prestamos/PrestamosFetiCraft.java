@@ -19,16 +19,20 @@ import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.java.JavaPlugin;
+import org.bukkit.util.io.BukkitObjectInputStream;
 import org.bukkit.util.io.BukkitObjectOutputStream;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.DriverManager;
 import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.UUID;
 
@@ -39,9 +43,9 @@ public final class PrestamosFetiCraft extends JavaPlugin
     private NamespacedKey actionKey;
     private Connection database;
 
-    private static final String MENU_TITLE =
-            "&8Préstamos de FetiCraft";
-
+    private static final String MENU_TITLE = "&8Préstamos de FetiCraft";
+    private static final String MARKET_TITLE = "&8Mercado de préstamos";
+    private static final String LISTINGS_TITLE = "&8Mis anuncios";
     private static final long MAX_DURATION_MINUTES = 43200;
 
     @Override
@@ -49,20 +53,14 @@ public final class PrestamosFetiCraft extends JavaPlugin
         actionKey = new NamespacedKey(this, "menu_action");
 
         if (!setupEconomy()) {
-            getLogger().severe(
-                    "No se ha encontrado la economía de Vault."
-            );
-            getLogger().severe(
-                    "Comprueba que Vault y Mineconomy estén activos."
-            );
+            getLogger().severe("No se ha encontrado la economía de Vault.");
+            getLogger().severe("Comprueba que Vault y Mineconomy estén activos.");
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
 
         if (!openDatabase()) {
-            getLogger().severe(
-                    "No se pudo inicializar SQLite. Plugin desactivado."
-            );
+            getLogger().severe("No se pudo inicializar SQLite. Plugin desactivado.");
             getServer().getPluginManager().disablePlugin(this);
             return;
         }
@@ -70,9 +68,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
         getServer().getPluginManager().registerEvents(this, this);
 
         if (getCommand("prestamos") == null) {
-            getLogger().severe(
-                    "No se encuentra prestamos en plugin.yml."
-            );
+            getLogger().severe("No se encuentra prestamos en plugin.yml.");
             closeDatabase();
             getServer().getPluginManager().disablePlugin(this);
             return;
@@ -80,20 +76,12 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
         getCommand("prestamos").setExecutor(this);
 
-        getLogger().info(
-                "Préstamos de FetiCraft iniciado correctamente."
-        );
-        getLogger().info(
-                "Economía conectada: " + economy.getName()
-        );
-        getLogger().info(
-                "Base de datos SQLite inicializada correctamente."
-        );
-        getLogger().info(
-                "Publicación de objetos habilitada en fase inicial."
-        );
+        getLogger().info("Préstamos de FetiCraft iniciado correctamente.");
+        getLogger().info("Economía conectada: " + economy.getName());
+        getLogger().info("Base de datos SQLite inicializada correctamente.");
+        getLogger().info("Mercado y consulta de anuncios habilitados.");
         getLogger().warning(
-                "Alquileres y recuperación automática aún no implementados."
+                "Los alquileres, las devoluciones y la recuperación automática aún no están implementados."
         );
     }
 
@@ -119,9 +107,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
             File folder = getDataFolder();
 
             if (!folder.exists() && !folder.mkdirs()) {
-                getLogger().severe(
-                        "No se pudo crear la carpeta del plugin."
-                );
+                getLogger().severe("No se pudo crear la carpeta del plugin.");
                 return false;
             }
 
@@ -162,14 +148,12 @@ public final class PrestamosFetiCraft extends JavaPlugin
                     """);
 
                 statement.execute("""
-                    CREATE INDEX IF NOT EXISTS
-                    idx_listings_status_created
+                    CREATE INDEX IF NOT EXISTS idx_listings_status_created
                     ON listings(status, created_at)
                     """);
 
                 statement.execute("""
-                    CREATE INDEX IF NOT EXISTS
-                    idx_listings_owner
+                    CREATE INDEX IF NOT EXISTS idx_listings_owner
                     ON listings(owner_uuid, status)
                     """);
 
@@ -190,14 +174,12 @@ public final class PrestamosFetiCraft extends JavaPlugin
                                 'RETURNED',
                                 'RECOVERY_REQUIRED'
                             )),
-                        FOREIGN KEY(listing_id)
-                            REFERENCES listings(id)
+                        FOREIGN KEY(listing_id) REFERENCES listings(id)
                     )
                     """);
 
                 statement.execute("""
-                    CREATE INDEX IF NOT EXISTS
-                    idx_rentals_renter_status
+                    CREATE INDEX IF NOT EXISTS idx_rentals_renter_status
                     ON rentals(renter_uuid, status)
                     """);
 
@@ -224,10 +206,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
             return true;
         } catch (SQLException exception) {
             getLogger().severe(
-                    "Error inicializando SQLite: "
-                            + exception.getMessage()
+                    "Error inicializando SQLite: " + exception.getMessage()
             );
-
             closeDatabase();
             return false;
         }
@@ -254,8 +234,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
             return true;
         }
 
-        if (args.length > 0
-                && args[0].equalsIgnoreCase("publicar")) {
+        if (args.length > 0 && args[0].equalsIgnoreCase("publicar")) {
             if (args.length != 3) {
                 player.sendMessage(color(
                         "&eUso: /prestamos publicar <precio> <minutos>"
@@ -293,22 +272,18 @@ public final class PrestamosFetiCraft extends JavaPlugin
         }
 
         if (!Double.isFinite(price) || price <= 0) {
-            player.sendMessage(color(
-                    "&cEl precio debe ser mayor que cero."
-            ));
+            player.sendMessage(color("&cEl precio debe ser mayor que cero."));
             return;
         }
 
-        if (durationMinutes < 1
-                || durationMinutes > MAX_DURATION_MINUTES) {
+        if (durationMinutes < 1 || durationMinutes > MAX_DURATION_MINUTES) {
             player.sendMessage(color(
                     "&cLa duración debe estar entre 1 minuto y 30 días."
             ));
             return;
         }
 
-        ItemStack hand =
-                player.getInventory().getItemInMainHand();
+        ItemStack hand = player.getInventory().getItemInMainHand();
 
         if (hand.getType() == Material.AIR || hand.getAmount() <= 0) {
             player.sendMessage(color(
@@ -318,9 +293,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
         }
 
         if (database == null) {
-            player.sendMessage(color(
-                    "&cLa base de datos no está disponible."
-            ));
+            player.sendMessage(color("&cLa base de datos no está disponible."));
             return;
         }
 
@@ -331,9 +304,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
             itemData = serializeItem(storedItem);
         } catch (IOException exception) {
             getLogger().severe(
-                    "No se pudo serializar el objeto de "
-                            + player.getName() + ": "
-                            + exception.getMessage()
+                    "No se pudo serializar el objeto de " + player.getName()
+                            + ": " + exception.getMessage()
             );
             player.sendMessage(color(
                     "&cNo se pudo guardar el objeto. No se ha retirado."
@@ -350,8 +322,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
             database.setAutoCommit(false);
 
             try {
-                try (PreparedStatement listing =
-                             database.prepareStatement("""
+                try (PreparedStatement listing = database.prepareStatement("""
                     INSERT INTO listings (
                         id, owner_uuid, owner_name, item_data,
                         price, duration_seconds, status,
@@ -360,9 +331,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
                               ?, ?, 0)
                     """)) {
                     listing.setString(1, listingId);
-                    listing.setString(
-                            2, player.getUniqueId().toString()
-                    );
+                    listing.setString(2, player.getUniqueId().toString());
                     listing.setString(3, player.getName());
                     listing.setBytes(4, itemData);
                     listing.setDouble(5, price);
@@ -372,8 +341,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
                     listing.executeUpdate();
                 }
 
-                try (PreparedStatement operation =
-                             database.prepareStatement("""
+                try (PreparedStatement operation = database.prepareStatement("""
                     INSERT INTO operations (
                         id, operation_type, listing_id, player_uuid,
                         status, details, created_at, updated_at
@@ -381,9 +349,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
                     """)) {
                     operation.setString(1, operationId);
                     operation.setString(2, listingId);
-                    operation.setString(
-                            3, player.getUniqueId().toString()
-                    );
+                    operation.setString(3, player.getUniqueId().toString());
                     operation.setString(
                             4, "Publicación en preparación; anuncio bloqueado."
                     );
@@ -405,23 +371,20 @@ public final class PrestamosFetiCraft extends JavaPlugin
             }
         } catch (SQLException exception) {
             getLogger().severe(
-                    "No se pudo preparar la publicación "
-                            + listingId + ": " + exception.getMessage()
+                    "No se pudo preparar la publicación " + listingId
+                            + ": " + exception.getMessage()
             );
             player.sendMessage(color(
-                    "&cNo se pudo preparar el anuncio. "
-                            + "Tu objeto no se ha retirado."
+                    "&cNo se pudo preparar el anuncio. Tu objeto no se ha retirado."
             ));
             return;
         }
 
-        ItemStack currentHand =
-                player.getInventory().getItemInMainHand();
+        ItemStack currentHand = player.getInventory().getItemInMainHand();
 
         if (!storedItem.equals(currentHand)) {
             player.sendMessage(color(
-                    "&cEl objeto de tu mano ha cambiado. "
-                            + "El anuncio queda bloqueado para revisión."
+                    "&cEl objeto de tu mano ha cambiado. El anuncio queda bloqueado para revisión."
             ));
             markRecoveryRequired(
                     operationId,
@@ -437,46 +400,34 @@ public final class PrestamosFetiCraft extends JavaPlugin
             database.setAutoCommit(false);
 
             try {
-                try (PreparedStatement listing =
-                             database.prepareStatement("""
+                try (PreparedStatement listing = database.prepareStatement("""
                     UPDATE listings
                     SET status = 'AVAILABLE',
                         updated_at = ?,
                         version = version + 1
                     WHERE id = ? AND status = 'RECOVERY_REQUIRED'
                     """)) {
-                    listing.setLong(
-                            1, System.currentTimeMillis()
-                    );
+                    listing.setLong(1, System.currentTimeMillis());
                     listing.setString(2, listingId);
 
                     if (listing.executeUpdate() != 1) {
-                        throw new SQLException(
-                                "No se pudo activar el anuncio."
-                        );
+                        throw new SQLException("No se pudo activar el anuncio.");
                     }
                 }
 
-                try (PreparedStatement operation =
-                             database.prepareStatement("""
+                try (PreparedStatement operation = database.prepareStatement("""
                     UPDATE operations
                     SET status = 'COMMITTED',
                         details = ?,
                         updated_at = ?
                     WHERE id = ? AND status = 'PREPARED'
                     """)) {
-                    operation.setString(
-                            1, "Objeto guardado y anuncio activado."
-                    );
-                    operation.setLong(
-                            2, System.currentTimeMillis()
-                    );
+                    operation.setString(1, "Objeto guardado y anuncio activado.");
+                    operation.setLong(2, System.currentTimeMillis());
                     operation.setString(3, operationId);
 
                     if (operation.executeUpdate() != 1) {
-                        throw new SQLException(
-                                "No se pudo confirmar la operación."
-                        );
+                        throw new SQLException("No se pudo confirmar la operación.");
                     }
                 }
 
@@ -501,53 +452,57 @@ public final class PrestamosFetiCraft extends JavaPlugin
             markRecoveryRequired(
                     operationId,
                     listingId,
-                    "Error al confirmar la publicación: "
-                            + exception.getMessage()
+                    "Error al confirmar la publicación: " + exception.getMessage()
             );
 
             player.sendMessage(color(
                     "&cHa ocurrido un error al finalizar la publicación."
             ));
             player.sendMessage(color(
-                    "&eNo vuelvas a publicar ese objeto. "
-                            + "Contacta con un administrador indicando el ID:"
+                    "&eNo vuelvas a publicar ese objeto. ID:"
             ));
             player.sendMessage(color("&7" + listingId));
             return;
         }
 
+        player.sendMessage(color("&aAnuncio publicado correctamente."));
+        player.sendMessage(color("&7ID: &f" + listingId));
+        player.sendMessage(color("&7Precio anunciado: &f" + price + " monedas"));
         player.sendMessage(color(
-                "&aAnuncio publicado correctamente."
-        ));
-        player.sendMessage(color(
-                "&7ID: &f" + listingId
-        ));
-        player.sendMessage(color(
-                "&7Precio: &f" + price + " monedas"
-        ));
-        player.sendMessage(color(
-                "&7Duración: &f" + durationMinutes + " minutos"
+                "&7Duración del alquiler: &f" + durationMinutes + " minutos"
         ));
         player.sendMessage(color(
                 "&eEl objeto está guardado en la base de datos."
         ));
 
         getLogger().info(
-                "Anuncio " + listingId + " creado por "
-                        + player.getName() + ". Precio: "
-                        + price + ", duración: "
+                "Anuncio " + listingId + " creado por " + player.getName()
+                        + ". Precio: " + price + ", duración: "
                         + durationMinutes + " minutos."
         );
     }
 
     private byte[] serializeItem(ItemStack item) throws IOException {
-        try (ByteArrayOutputStream bytes =
-                     new ByteArrayOutputStream();
+        try (ByteArrayOutputStream bytes = new ByteArrayOutputStream();
              BukkitObjectOutputStream output =
                      new BukkitObjectOutputStream(bytes)) {
             output.writeObject(item);
             output.flush();
             return bytes.toByteArray();
+        }
+    }
+
+    private ItemStack deserializeItem(byte[] data)
+            throws IOException, ClassNotFoundException {
+        try (ByteArrayInputStream bytes = new ByteArrayInputStream(data);
+             BukkitObjectInputStream input = new BukkitObjectInputStream(bytes)) {
+            Object object = input.readObject();
+
+            if (!(object instanceof ItemStack item)) {
+                throw new IOException("El registro no contiene un ItemStack.");
+            }
+
+            return item;
         }
     }
 
@@ -564,23 +519,19 @@ public final class PrestamosFetiCraft extends JavaPlugin
             database.setAutoCommit(false);
 
             try {
-                try (PreparedStatement listing =
-                             database.prepareStatement("""
+                try (PreparedStatement listing = database.prepareStatement("""
                     UPDATE listings
                     SET status = 'RECOVERY_REQUIRED',
                         updated_at = ?,
                         version = version + 1
                     WHERE id = ?
                     """)) {
-                    listing.setLong(
-                            1, System.currentTimeMillis()
-                    );
+                    listing.setLong(1, System.currentTimeMillis());
                     listing.setString(2, listingId);
                     listing.executeUpdate();
                 }
 
-                try (PreparedStatement operation =
-                             database.prepareStatement("""
+                try (PreparedStatement operation = database.prepareStatement("""
                     UPDATE operations
                     SET status = 'RECOVERY_REQUIRED',
                         details = ?,
@@ -588,9 +539,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
                     WHERE id = ?
                     """)) {
                     operation.setString(1, details);
-                    operation.setLong(
-                            2, System.currentTimeMillis()
-                    );
+                    operation.setLong(2, System.currentTimeMillis());
                     operation.setString(3, operationId);
                     operation.executeUpdate();
                 }
@@ -608,9 +557,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
             }
         } catch (SQLException exception) {
             getLogger().severe(
-                    "CRÍTICO: no se pudo registrar la recuperación "
-                            + "del anuncio " + listingId + ": "
-                            + exception.getMessage()
+                    "CRÍTICO: no se pudo registrar la recuperación del anuncio "
+                            + listingId + ": " + exception.getMessage()
             );
         }
     }
@@ -651,7 +599,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
         addButton(
                 inventory, 23, Material.WRITABLE_BOOK,
                 "&dMis anuncios",
-                "Administrar tus anuncios.",
+                "Consultar tus anuncios publicados.",
                 "listings"
         );
 
@@ -676,7 +624,7 @@ public final class PrestamosFetiCraft extends JavaPlugin
         meta.setDisplayName(color(title));
         meta.setLore(List.of(
                 color("&7" + description),
-                color("&8Función en desarrollo")
+                color("&8Pulsa para abrir")
         ));
 
         meta.getPersistentDataContainer().set(
@@ -689,10 +637,152 @@ public final class PrestamosFetiCraft extends JavaPlugin
         inventory.setItem(slot, item);
     }
 
+    private void openListings(Player player, boolean ownListings) {
+        Inventory inventory = Bukkit.createInventory(
+                null,
+                54,
+                color(ownListings ? LISTINGS_TITLE : MARKET_TITLE)
+        );
+
+        String sql = ownListings
+                ? """
+                  SELECT id, owner_name, item_data, price,
+                         duration_seconds, status
+                  FROM listings
+                  WHERE owner_uuid = ?
+                    AND status NOT IN ('CANCELLED', 'CLAIMED')
+                  ORDER BY created_at DESC
+                  LIMIT 45
+                  """
+                : """
+                  SELECT id, owner_name, item_data, price,
+                         duration_seconds, status
+                  FROM listings
+                  WHERE status = 'AVAILABLE'
+                  ORDER BY created_at DESC
+                  LIMIT 45
+                  """;
+
+        int count = 0;
+
+        try (PreparedStatement statement = database.prepareStatement(sql)) {
+            if (ownListings) {
+                statement.setString(1, player.getUniqueId().toString());
+            }
+
+            try (ResultSet result = statement.executeQuery()) {
+                while (result.next() && count < 45) {
+                    String id = result.getString("id");
+                    String owner = result.getString("owner_name");
+                    double price = result.getDouble("price");
+                    long duration = result.getLong("duration_seconds");
+                    String status = result.getString("status");
+                    byte[] data = result.getBytes("item_data");
+
+                    ItemStack item;
+
+                    try {
+                        item = deserializeItem(data);
+                    } catch (IOException | ClassNotFoundException exception) {
+                        getLogger().warning(
+                                "No se pudo leer el objeto del anuncio " + id
+                                        + ": " + exception.getMessage()
+                        );
+
+                        item = new ItemStack(Material.BARRIER);
+                        ItemMeta errorMeta = item.getItemMeta();
+
+                        if (errorMeta != null) {
+                            errorMeta.setDisplayName(color(
+                                    "&cObjeto pendiente de revisión"
+                            ));
+                            item.setItemMeta(errorMeta);
+                        }
+                    }
+
+                    ItemMeta meta = item.getItemMeta();
+
+                    if (meta != null) {
+                        List<String> lore = meta.getLore() == null
+                                ? new ArrayList<>()
+                                : new ArrayList<>(meta.getLore());
+
+                        lore.add(color("&8----------------"));
+                        lore.add(color("&7Propietario: &f" + owner));
+                        lore.add(color("&7Precio anunciado: &e"
+                                + price + " monedas"));
+                        lore.add(color("&7Duración: &f"
+                                + (duration / 60) + " minutos"));
+                        lore.add(color("&7Estado: &f" + status));
+                        lore.add(color("&8ID: " + id));
+
+                        if ("AVAILABLE".equals(status)) {
+                            lore.add(color("&aDisponible en el mercado"));
+                        } else {
+                            lore.add(color("&eNo disponible para alquilar"));
+                        }
+
+                        meta.setLore(lore);
+                        item.setItemMeta(meta);
+                    }
+
+                    inventory.setItem(count++, item);
+                }
+            }
+        } catch (SQLException exception) {
+            getLogger().severe(
+                    "Error consultando anuncios: " + exception.getMessage()
+            );
+            player.sendMessage(color(
+                    "&cNo se pudieron consultar los anuncios."
+            ));
+            return;
+        }
+
+        if (count == 0) {
+            ItemStack empty = new ItemStack(Material.PAPER);
+            ItemMeta emptyMeta = empty.getItemMeta();
+
+            if (emptyMeta != null) {
+                emptyMeta.setDisplayName(color("&eNo hay anuncios"));
+                emptyMeta.setLore(List.of(
+                        color(ownListings
+                                ? "&7Todavía no tienes anuncios visibles."
+                                : "&7No hay objetos disponibles en el mercado.")
+                ));
+                empty.setItemMeta(emptyMeta);
+            }
+
+            inventory.setItem(22, empty);
+        }
+
+        ItemStack back = new ItemStack(Material.ARROW);
+        ItemMeta backMeta = back.getItemMeta();
+
+        if (backMeta != null) {
+            backMeta.setDisplayName(color("&cVolver al menú"));
+            backMeta.setLore(List.of(color("&7Regresar al menú principal")));
+            backMeta.getPersistentDataContainer().set(
+                    actionKey,
+                    PersistentDataType.STRING,
+                    "back"
+            );
+            back.setItemMeta(backMeta);
+        }
+
+        inventory.setItem(49, back);
+        player.openInventory(inventory);
+    }
+
     @EventHandler
     public void onMenuClick(InventoryClickEvent event) {
-        if (!ChatColor.stripColor(event.getView().getTitle())
-                .equals("Préstamos de FetiCraft")) {
+        String title = ChatColor.stripColor(event.getView().getTitle());
+
+        boolean mainMenu = "Préstamos de FetiCraft".equals(title);
+        boolean marketMenu = "Mercado de préstamos".equals(title);
+        boolean listingsMenu = "Mis anuncios".equals(title);
+
+        if (!mainMenu && !marketMenu && !listingsMenu) {
             return;
         }
 
@@ -704,15 +794,22 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
         int slot = event.getRawSlot();
 
-        if (slot < 0
-                || slot >= event.getView()
-                        .getTopInventory().getSize()) {
+        if (slot < 0 || slot >= event.getView().getTopInventory().getSize()) {
             return;
         }
 
         ItemStack clicked = event.getCurrentItem();
 
         if (clicked == null || !clicked.hasItemMeta()) {
+            return;
+        }
+
+        if ((marketMenu || listingsMenu) && slot == 49) {
+            openMainMenu(player);
+            return;
+        }
+
+        if (!mainMenu) {
             return;
         }
 
@@ -725,26 +822,17 @@ public final class PrestamosFetiCraft extends JavaPlugin
         }
 
         switch (action) {
-            case "market" ->
-                    player.sendMessage(color(
-                            "&eEl mercado estará disponible en otra etapa."
-                    ));
-            case "publish" ->
-                    player.sendMessage(color(
-                            "&eUsa: /prestamos publicar <precio> <minutos>"
-                    ));
-            case "rentals" ->
-                    player.sendMessage(color(
-                            "&eLos alquileres aún no están activados."
-                    ));
-            case "returns" ->
-                    player.sendMessage(color(
-                            "&eLas devoluciones aún no están activadas."
-                    ));
-            case "listings" ->
-                    player.sendMessage(color(
-                            "&eLa gestión de anuncios aún no está activada."
-                    ));
+            case "market" -> openListings(player, false);
+            case "listings" -> openListings(player, true);
+            case "publish" -> player.sendMessage(color(
+                    "&eUsa: /prestamos publicar <precio> <minutos>"
+            ));
+            case "rentals" -> player.sendMessage(color(
+                    "&eLos alquileres todavía no están implementados."
+            ));
+            case "returns" -> player.sendMessage(color(
+                    "&eLas devoluciones todavía no están implementadas."
+            ));
             default -> {
             }
         }
@@ -752,8 +840,11 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
     @EventHandler
     public void onMenuDrag(InventoryDragEvent event) {
-        if (ChatColor.stripColor(event.getView().getTitle())
-                .equals("Préstamos de FetiCraft")) {
+        String title = ChatColor.stripColor(event.getView().getTitle());
+
+        if ("Préstamos de FetiCraft".equals(title)
+                || "Mercado de préstamos".equals(title)
+                || "Mis anuncios".equals(title)) {
             event.setCancelled(true);
         }
     }
@@ -781,8 +872,6 @@ public final class PrestamosFetiCraft extends JavaPlugin
     @Override
     public void onDisable() {
         closeDatabase();
-        getLogger().info(
-                "Préstamos de FetiCraft desactivado."
-        );
+        getLogger().info("Préstamos de FetiCraft desactivado.");
     }
 }
