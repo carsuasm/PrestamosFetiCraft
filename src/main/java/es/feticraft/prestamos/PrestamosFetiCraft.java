@@ -7,9 +7,8 @@ import org.bukkit.Material;
 import org.bukkit.NamespacedKey;
 import org.bukkit.OfflinePlayer;
 import org.bukkit.command.Command;
+import org.bukkit.command.CommandExecutor;
 import org.bukkit.command.CommandSender;
-import org.bukkit.entity.Entity;
-import org.bukkit.entity.Item;
 import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
@@ -46,7 +45,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
-public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
+public final class PrestamosFetiCraft extends JavaPlugin implements Listener, CommandExecutor {
     private Economy economy;
     private NamespacedKey actionKey;
     private NamespacedKey listingKey;
@@ -79,7 +78,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
             return;
         }
         getCommand("prestamos").setExecutor(this);
-        // Revisar alquileres caducados de jugadores conectados cada segundo.
+        // Procesar alquileres caducados cada segundo para jugadores conectados y desconectados (global).
         Bukkit.getScheduler().runTaskTimer(this, this::processAllExpiredRentals, 20L, 20L);
         getLogger().info("Préstamos de FetiCraft iniciado correctamente.");
         getLogger().info("Economía conectada: " + economy.getName());
@@ -129,22 +128,31 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
             message(player, "&cNo tienes permiso para usar los préstamos.");
             return true;
         }
-        if (args.length > 0 && args[0].equalsIgnoreCase("publicar")) {
-            if (args.length != 3) {
-                message(player, "&eUso: /prestamos publicar <precio> <minutos>");
+        if (args.length > 0) {
+            if (args[0].equalsIgnoreCase("publicar")) {
+                if (args.length != 3) {
+                    message(player, "&eUso: /prestamos publicar <precio> <minutos>");
+                    return true;
+                }
+                double price;
+                long minutes;
+                try {
+                    price = Double.parseDouble(args[1]);
+                    minutes = Long.parseLong(args[2]);
+                } catch (NumberFormatException ex) {
+                    message(player, "&cEl precio y los minutos deben ser números válidos.");
+                    return true;
+                }
+                publishItem(player, price, minutes);
+                return true;
+            } else if (args[0].equalsIgnoreCase("devolver")) {
+                if (args.length != 2) {
+                    message(player, "&eUso: /prestamos devolver <id_alquiler>");
+                    return true;
+                }
+                returnEarly(player, args[1]);
                 return true;
             }
-            double price;
-            long minutes;
-            try {
-                price = Double.parseDouble(args[1]);
-                minutes = Long.parseLong(args[2]);
-            } catch (NumberFormatException ex) {
-                message(player, "&cEl precio y los minutos deben ser números válidos.");
-                return true;
-            }
-            publishItem(player, price, minutes);
-            return true;
         }
         openMainMenu(player);
         return true;
@@ -175,7 +183,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
             }
             database.commit();
             database.setAutoCommit(true);
-            // No se elimina el objeto si la mano cambió durante la operación.
+
             if (!hand.equals(player.getInventory().getItemInMainHand())) {
                 markRecoveryRequired(operationId, listingId, "La mano cambió durante la publicación; revisar manualmente.");
                 message(player, "&cPublicación pendiente de revisión. No se ha retirado ningún objeto automáticamente.");
@@ -270,23 +278,104 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                     lore.add(color("&7Precio: &a" + money(rs.getDouble("price"))));
                     lore.add(color("&7Duración: &f" + formatDuration(rs.getLong("duration_seconds"))));
                     lore.add(color("&7Estado: &f" + rs.getString("status")));
-                    lore.add(color("&8ID: " + rs.getString("id").substring(0, 8)));
-                    if (!ownListings && "AVAILABLE".equals(rs.getString("status"))) lore.add(color("&aPulsa para alquilar"));
+                    String listingId = rs.getString("id");
+                    lore.add(color("&8ID: " + listingId.substring(0, 8)));
+                    
                     if (meta == null) meta = Bukkit.getItemFactory().getItemMeta(item.getType());
                     if (meta != null) {
+                        meta.getPersistentDataContainer().set(listingKey, PersistentDataType.STRING, listingId);
+                        if (ownListings && "AVAILABLE".equals(rs.getString("status"))) {
+                            lore.add(color("&cPulsa para cancelar anuncio"));
+                            meta.getPersistentDataContainer().set(actionKey, PersistentDataType.STRING, "cancel_listing");
+                        } else if (!ownListings && "AVAILABLE".equals(rs.getString("status"))) {
+                            lore.add(color("&aPulsa para alquilar"));
+                        }
                         meta.setLore(lore);
-                        meta.getPersistentDataContainer().set(listingKey, PersistentDataType.STRING, rs.getString("id"));
                         item.setItemMeta(meta);
                     }
                     inv.setItem(slot++, item);
                 }
             }
         } catch (Exception e) {
-            getLogger().warning("No se pudo cargar el mercado: " + e.getMessage());
+            getLogger().warning("No se pudo cargar el mercado/anuncios: " + e.getMessage());
             message(player, "&cNo se pudieron cargar los anuncios.");
         }
         addButton(inv, 49, Material.ARROW, "&cVolver", List.of(), "back_main");
         player.openInventory(inv);
+    }
+
+    private void cancelListing(Player player, String listingId) {
+        String operationId = UUID.randomUUID().toString();
+        ItemStack item;
+        try {
+            if (player.getInventory().firstEmpty() == -1) {
+                message(player, "&cNecesitas al menos un espacio libre en el inventario para recuperar tu objeto.");
+                return;
+            }
+            database.setAutoCommit(false);
+            try (PreparedStatement ps = database.prepareStatement("SELECT item_data,status FROM listings WHERE id=? AND owner_uuid=?")) {
+                ps.setString(1, listingId);
+                ps.setString(2, player.getUniqueId().toString());
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (!rs.next() || !"AVAILABLE".equals(rs.getString("status"))) {
+                        database.rollback(); database.setAutoCommit(true);
+                        message(player, "&cEste anuncio ya no está disponible para ser cancelado.");
+                        return;
+                    }
+                    item = deserializeItem(rs.getBytes("item_data"));
+                }
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='CANCELLED',updated_at=?,version=version+1 WHERE id=? AND status='AVAILABLE'")) {
+                ps.setLong(1, System.currentTimeMillis());
+                ps.setString(2, listingId);
+                if (ps.executeUpdate() != 1) {
+                    database.rollback(); database.setAutoCommit(true);
+                    message(player, "&cNo se pudo cancelar el anuncio.");
+                    return;
+                }
+            }
+            try (PreparedStatement ps = database.prepareStatement("INSERT INTO operations(id,operation_type,listing_id,player_uuid,status,details,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")) {
+                ps.setString(1, operationId);
+                ps.setString(2, "CANCEL_LISTING");
+                ps.setString(3, listingId);
+                ps.setString(4, player.getUniqueId().toString());
+                ps.setString(5, "PREPARED");
+                ps.setString(6, "Anuncio cancelado; devolviendo objeto");
+                long now = System.currentTimeMillis();
+                ps.setLong(7, now);
+                ps.setLong(8, now);
+                ps.executeUpdate();
+            }
+            database.commit(); database.setAutoCommit(true);
+        } catch (Exception e) {
+            try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+            getLogger().warning("Error cancelando anuncio: " + e.getMessage());
+            message(player, "&cOcurrió un error al cancelar el anuncio.");
+            return;
+        }
+
+        Map<Integer, ItemStack> leftovers = player.getInventory().addItem(item);
+        if (!leftovers.isEmpty()) {
+            message(player, "&cInventario lleno. El objeto se ha guardado en tus devoluciones.");
+            try {
+                database.setAutoCommit(false);
+                try (PreparedStatement ps = database.prepareStatement("INSERT OR IGNORE INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+                    ps.setString(1, "cancel_" + listingId);
+                    ps.setString(2, listingId);
+                    ps.setString(3, player.getUniqueId().toString());
+                    ps.setString(4, player.getUniqueId().toString());
+                    ps.setBytes(5, serializeItem(item));
+                    ps.setLong(6, System.currentTimeMillis());
+                    ps.executeUpdate();
+                }
+                database.commit(); database.setAutoCommit(true);
+            } catch (Exception ex) {
+                getLogger().severe("Error guardando objeto cancelado en returns: " + ex.getMessage());
+            }
+        } else {
+            message(player, "&aHas cancelado tu anuncio y recuperado tu objeto.");
+        }
+        openListings(player, true);
     }
 
     private void openRentalConfirmation(Player player, String listingId) {
@@ -327,7 +416,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
         String rentalId = UUID.randomUUID().toString();
         String operationId = UUID.randomUUID().toString();
         String ownerUuid;
-        String ownerName;
         double price;
         long duration;
         ItemStack item;
@@ -338,14 +426,14 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                 return;
             }
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("SELECT owner_uuid,owner_name,item_data,price,duration_seconds,status FROM listings WHERE id=?")) {
+            try (PreparedStatement ps = database.prepareStatement("SELECT owner_uuid,item_data,price,duration_seconds,status FROM listings WHERE id=?")) {
                 ps.setString(1, listingId);
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next() || !"AVAILABLE".equals(rs.getString("status"))) {
                         database.rollback(); database.setAutoCommit(true);
                         message(renter, "&cEste anuncio ya no está disponible."); return;
                     }
-                    ownerUuid = rs.getString("owner_uuid"); ownerName = rs.getString("owner_name");
+                    ownerUuid = rs.getString("owner_uuid");
                     price = rs.getDouble("price"); duration = rs.getLong("duration_seconds");
                     if (ownerUuid.equals(renter.getUniqueId().toString())) {
                         database.rollback(); database.setAutoCommit(true);
@@ -358,7 +446,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                 database.rollback(); database.setAutoCommit(true);
                 message(renter, "&cNo tienes dinero suficiente."); return;
             }
-            // Reserva atómica del anuncio para que no lo alquilen dos jugadores a la vez.
             try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RENTED',updated_at=?,version=version+1 WHERE id=? AND status='AVAILABLE'")) {
                 ps.setLong(1, now); ps.setString(2, listingId);
                 if (ps.executeUpdate() != 1) {
@@ -380,7 +467,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
             return;
         }
 
-        // Vault no ofrece una transacción conjunta con SQLite. Si falla un paso, intentamos compensar y marcamos recuperación si no se puede.
         boolean renterCharged = false;
         boolean ownerPaid = false;
         try {
@@ -414,7 +500,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                 catch (Exception ex) { compensated = false; }
             }
             setRentalRecovery(rentalId, listingId, operationId, "Error en cobro/entrega: " + e.getMessage() + "; compensación=" + compensated);
-            message(renter, "&cEl alquiler ha fallado durante el cobro o la entrega. Se ha marcado para revisión. Contacta con un administrador y no repitas la operación.");
+            message(renter, "&cEl alquiler ha fallado durante el cobro o la entrega. Se ha marcado para revisión.");
         }
     }
 
@@ -440,12 +526,17 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                 while (rs.next() && slot < 45) {
                     ItemStack item = deserializeItem(rs.getBytes("item_data"));
                     ItemMeta meta = item.getItemMeta();
+                    String rentalId = rs.getString("id");
                     if (meta != null) {
                         List<String> lore = meta.hasLore() ? new ArrayList<>(meta.getLore()) : new ArrayList<>();
                         lore.add(color("&7Propietario: &f" + rs.getString("owner_name")));
                         lore.add(color("&7Estado: &f" + rs.getString("status")));
                         long remaining = Math.max(0, (rs.getLong("expires_at") - System.currentTimeMillis() + 999L) / 1000L);
                         lore.add(color("&7Tiempo restante: &e" + formatDuration(remaining)));
+                        lore.add(color("&ePulsa para devolver anticipadamente"));
+                        meta.getPersistentDataContainer().set(rentalKey, PersistentDataType.STRING, rentalId);
+                        meta.getPersistentDataContainer().set(actionKey, PersistentDataType.STRING, "return_early_gui");
+                        meta.setLore(lore);
                         item.setItemMeta(meta);
                     }
                     inv.setItem(slot++, item);
@@ -454,6 +545,88 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
         } catch (Exception e) { getLogger().warning("Error mostrando alquileres: " + e.getMessage()); }
         addButton(inv, 49, Material.ARROW, "&cVolver", List.of(), "back_main");
         player.openInventory(inv);
+    }
+
+    private void returnEarly(Player player, String rentalId) {
+        String listingId;
+        String ownerUuid;
+        try (PreparedStatement ps = database.prepareStatement("SELECT listing_id,owner_uuid FROM rentals WHERE id=? AND renter_uuid=? AND status='ACTIVE'")) {
+            ps.setString(1, rentalId);
+            ps.setString(2, player.getUniqueId().toString());
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) {
+                    message(player, "&cNo se ha encontrado un alquiler activo con ese ID.");
+                    return;
+                }
+                listingId = rs.getString("listing_id");
+                ownerUuid = rs.getString("owner_uuid");
+            }
+        } catch (SQLException e) {
+            message(player, "&cError al procesar la devolución.");
+            return;
+        }
+
+        List<Integer> matches = new ArrayList<>();
+        ItemStack found = null;
+        ItemStack[] contents = player.getInventory().getContents();
+        for (int i = 0; i < contents.length; i++) {
+            ItemStack stack = contents[i];
+            if (hasRentalId(stack, rentalId)) {
+                matches.add(i);
+                found = stack.clone();
+            }
+        }
+
+        if (matches.size() != 1 || found == null) {
+            message(player, "&cDebes llevar el objeto alquilado exacto en tu inventario para devolverlo.");
+            return;
+        }
+
+        ItemMeta meta = found.getItemMeta();
+        if (meta != null) {
+            meta.getPersistentDataContainer().remove(rentalKey);
+            found.setItemMeta(meta);
+        }
+
+        try {
+            byte[] data = serializeItem(found);
+            database.setAutoCommit(false);
+            try (PreparedStatement ps = database.prepareStatement("INSERT INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+                ps.setString(1, rentalId);
+                ps.setString(2, listingId);
+                ps.setString(3, ownerUuid);
+                ps.setString(4, player.getUniqueId().toString());
+                ps.setBytes(5, data);
+                ps.setLong(6, System.currentTimeMillis());
+                ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
+                ps.setString(1, rentalId);
+                if (ps.executeUpdate() != 1) {
+                    database.rollback(); database.setAutoCommit(true);
+                    message(player, "&cEl alquiler ya ha sido procesado.");
+                    return;
+                }
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=?,version=version+1 WHERE id=? AND status='RENTED'")) {
+                ps.setLong(1, System.currentTimeMillis());
+                ps.setString(2, listingId);
+                ps.executeUpdate();
+            }
+            database.commit(); database.setAutoCommit(true);
+
+            player.getInventory().setItem(matches.get(0), null);
+            player.updateInventory();
+            message(player, "&aHas devuelto el objeto correctamente.");
+            Player owner = Bukkit.getPlayer(UUID.fromString(ownerUuid));
+            if (owner != null) {
+                message(owner, "&aUn jugador ha devuelto tu objeto anticipadamente. Recógelo en Mis devoluciones.");
+            }
+        } catch (Exception e) {
+            try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+            getLogger().severe("Error en devolución anticipada: " + e.getMessage());
+            message(player, "&cOcurrió un error al devolver el objeto.");
+        }
     }
 
     private void openReturns(Player player) {
@@ -495,58 +668,48 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
         String operationId = UUID.randomUUID().toString();
         long now = System.currentTimeMillis();
 
-        // Primero reservamos la devolución en SQLite. Mientras esté en RECOVERY_REQUIRED,
-        // no aparecerá como disponible para recogerla otra vez si el servidor se interrumpe.
         try {
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement(
-                    "SELECT listing_id,item_data FROM returns WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
+            try (PreparedStatement ps = database.prepareStatement("SELECT listing_id,item_data FROM returns WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
                 ps.setString(1, rentalId);
                 ps.setString(2, owner.getUniqueId().toString());
                 try (ResultSet rs = ps.executeQuery()) {
                     if (!rs.next()) {
-                        database.rollback();
-                        database.setAutoCommit(true);
-                        message(owner, "&cEsta devolución ya no está disponible o está pendiente de revisión.");
+                        database.rollback(); database.setAutoCommit(true);
+                        message(owner, "&cEsta devolución ya no está disponible.");
                         return;
                     }
                     listingId = rs.getString("listing_id");
                     item = deserializeItem(rs.getBytes("item_data"));
                 }
             }
-            try (PreparedStatement ps = database.prepareStatement(
-                    "UPDATE returns SET status='RECOVERY_REQUIRED' WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
+            try (PreparedStatement ps = database.prepareStatement("UPDATE returns SET status='RECOVERY_REQUIRED' WHERE rental_id=? AND owner_uuid=? AND status='PENDING'")) {
                 ps.setString(1, rentalId);
                 ps.setString(2, owner.getUniqueId().toString());
                 if (ps.executeUpdate() != 1) {
-                    database.rollback();
-                    database.setAutoCommit(true);
-                    message(owner, "&cOtro proceso está gestionando esta devolución. Vuelve a abrir el menú.");
+                    database.rollback(); database.setAutoCommit(true);
+                    message(owner, "&cOtro proceso está gestionando esta devolución.");
                     return;
                 }
             }
-            try (PreparedStatement ps = database.prepareStatement(
-                    "INSERT INTO operations(id,operation_type,listing_id,player_uuid,status,details,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")) {
+            try (PreparedStatement ps = database.prepareStatement("INSERT INTO operations(id,operation_type,listing_id,player_uuid,status,details,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")) {
                 ps.setString(1, operationId);
                 ps.setString(2, "CLAIM_RETURN");
                 ps.setString(3, listingId);
                 ps.setString(4, owner.getUniqueId().toString());
                 ps.setString(5, "PREPARED");
-                ps.setString(6, "Devolución reservada; entrega en curso");
+                ps.setString(6, "Devolución reservada");
                 ps.setLong(7, now);
                 ps.setLong(8, now);
                 ps.executeUpdate();
             }
-            database.commit();
-            database.setAutoCommit(true);
+            database.commit(); database.setAutoCommit(true);
         } catch (Exception e) {
             try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-            getLogger().severe("No se pudo reservar la devolución " + rentalId + ": " + e.getMessage());
-            message(owner, "&cNo se pudo preparar la devolución. No se ha entregado ningún objeto; vuelve a intentarlo.");
+            message(owner, "&cNo se pudo preparar la devolución.");
             return;
         }
 
-        // Retirar los datos internos del plugin antes de entregar el objeto original.
         ItemMeta meta = item.getItemMeta();
         if (meta != null) {
             meta.getPersistentDataContainer().remove(rentalKey);
@@ -556,140 +719,160 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
 
         Map<Integer, ItemStack> leftovers = owner.getInventory().addItem(item);
         if (!leftovers.isEmpty()) {
-            // No se ha podido entregar: vuelve a dejar la devolución disponible.
             try {
                 database.setAutoCommit(false);
-                try (PreparedStatement ps = database.prepareStatement(
-                        "UPDATE returns SET status='PENDING' WHERE rental_id=? AND status='RECOVERY_REQUIRED'")) {
+                try (PreparedStatement ps = database.prepareStatement("UPDATE returns SET status='PENDING' WHERE rental_id=? AND status='RECOVERY_REQUIRED'")) {
                     ps.setString(1, rentalId);
                     ps.executeUpdate();
                 }
-                try (PreparedStatement ps = database.prepareStatement(
-                        "UPDATE operations SET status='FAILED',details=?,updated_at=? WHERE id=?")) {
-                    ps.setString(1, "Inventario lleno durante la recogida; devolución reabierta");
-                    ps.setLong(2, System.currentTimeMillis());
-                    ps.setString(3, operationId);
-                    ps.executeUpdate();
-                }
-                database.commit();
-                database.setAutoCommit(true);
-            } catch (SQLException e) {
-                try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-                getLogger().severe("No se pudo reabrir la devolución " + rentalId + ": " + e.getMessage());
+                database.commit(); database.setAutoCommit(true);
+            } catch (SQLException ignored) {
+                try { database.setAutoCommit(true); } catch (Exception ex2) {}
             }
-            message(owner, "&cNo se ha podido entregar el objeto. Libera espacio y vuelve a intentarlo.");
+            message(owner, "&cNo hay espacio en el inventario.");
             return;
         }
 
-        // Solo se marca como recogida después de que Bukkit haya aceptado el objeto.
         try {
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement(
-                    "UPDATE returns SET status='CLAIMED' WHERE rental_id=? AND status='RECOVERY_REQUIRED'")) {
+            try (PreparedStatement ps = database.prepareStatement("UPDATE returns SET status='CLAIMED' WHERE rental_id=? AND status='RECOVERY_REQUIRED'")) {
                 ps.setString(1, rentalId);
-                if (ps.executeUpdate() != 1) throw new SQLException("La devolución ya no está reservada");
+                ps.executeUpdate();
             }
             try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURNED' WHERE id=?")) {
                 ps.setString(1, rentalId);
                 ps.executeUpdate();
             }
-            try (PreparedStatement ps = database.prepareStatement(
-                    "UPDATE listings SET status='CLAIMED',updated_at=?,version=version+1 WHERE id=?")) {
+            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='CLAIMED',updated_at=?,version=version+1 WHERE id=?")) {
                 ps.setLong(1, System.currentTimeMillis());
                 ps.setString(2, listingId);
                 ps.executeUpdate();
             }
-            try (PreparedStatement ps = database.prepareStatement(
-                    "UPDATE operations SET status='COMMITTED',details=?,updated_at=? WHERE id=?")) {
-                ps.setString(1, "Objeto entregado al propietario y devolución cerrada");
-                ps.setLong(2, System.currentTimeMillis());
-                ps.setString(3, operationId);
-                ps.executeUpdate();
-            }
-            database.commit();
-            database.setAutoCommit(true);
+            database.commit(); database.setAutoCommit(true);
             message(owner, "&aHas recuperado tu objeto devuelto.");
         } catch (Exception e) {
             try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-            // No reabrimos automáticamente: el objeto ya se ha entregado y reabrirla podría duplicarlo.
-            getLogger().severe("El objeto se entregó, pero no se pudo cerrar la devolución " + rentalId + ": " + e.getMessage());
-            message(owner, "&eEl objeto se ha entregado, pero el registro necesita revisión de un administrador. No vuelvas a reclamarlo.");
+            message(owner, "&eObjeto entregado, pero el registro requiere revisión administrativa.");
         }
     }
 
     private void processAllExpiredRentals() {
         if (database == null) return;
-        try (PreparedStatement ps = database.prepareStatement("SELECT id,renter_uuid FROM rentals WHERE status='ACTIVE' AND expires_at<=?")) {
+        try (PreparedStatement ps = database.prepareStatement("SELECT id,listing_id,renter_uuid,owner_uuid FROM rentals WHERE status='ACTIVE' AND expires_at<=?")) {
             ps.setLong(1, System.currentTimeMillis());
             List<String[]> due = new ArrayList<>();
-            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) due.add(new String[]{rs.getString("id"), rs.getString("renter_uuid")}); }
-            for (String[] row : due) {
-                Player renter = Bukkit.getPlayer(UUID.fromString(row[1]));
-                if (renter != null) expireRental(renter, row[0]);
-            }
-        } catch (Exception e) { getLogger().warning("Error revisando alquileres caducados: " + e.getMessage()); }
-    }
-
-    private void expirePlayerRentals(Player player) {
-        try (PreparedStatement ps = database.prepareStatement("SELECT id FROM rentals WHERE renter_uuid=? AND status='ACTIVE' AND expires_at<=?")) {
-            ps.setString(1, player.getUniqueId().toString()); ps.setLong(2, System.currentTimeMillis());
-            List<String> ids = new ArrayList<>();
-            try (ResultSet rs = ps.executeQuery()) { while (rs.next()) ids.add(rs.getString("id")); }
-            for (String id : ids) expireRental(player, id);
-        } catch (Exception e) { getLogger().warning("Error procesando alquileres al entrar: " + e.getMessage()); }
-    }
-
-    private void expireRental(Player renter, String rentalId) {
-        String listingId;
-        String ownerUuid;
-        try (PreparedStatement ps = database.prepareStatement("SELECT listing_id,owner_uuid FROM rentals WHERE id=? AND renter_uuid=? AND status='ACTIVE' AND expires_at<=?")) {
-            ps.setString(1, rentalId); ps.setString(2, renter.getUniqueId().toString()); ps.setLong(3, System.currentTimeMillis());
             try (ResultSet rs = ps.executeQuery()) {
-                if (!rs.next()) return;
-                listingId = rs.getString("listing_id"); ownerUuid = rs.getString("owner_uuid");
+                while (rs.next()) {
+                    due.add(new String[]{rs.getString("id"), rs.getString("listing_id"), rs.getString("renter_uuid"), rs.getString("owner_uuid")});
+                }
             }
-        } catch (SQLException e) { getLogger().warning("No se pudo consultar alquiler: " + e.getMessage()); return; }
-
-        List<Integer> matches = new ArrayList<>();
-        ItemStack found = null;
-        ItemStack[] contents = renter.getInventory().getContents();
-        for (int i = 0; i < contents.length; i++) {
-            ItemStack stack = contents[i];
-            if (hasRentalId(stack, rentalId)) { matches.add(i); found = stack.clone(); }
+            for (String[] row : due) {
+                processExpiredRental(row[0], row[1], UUID.fromString(row[2]), UUID.fromString(row[3]));
+            }
+        } catch (Exception e) {
+            getLogger().warning("Error procesando caducidades: " + e.getMessage());
         }
-        if (matches.size() != 1 || found == null) {
-            markRentalExpiredRecovery(rentalId, listingId, "Al caducar se encontraron " + matches.size() + " objetos marcados en el inventario del alquilador.");
-            message(renter, "&cTu alquiler ha caducado, pero no se ha podido localizar un único objeto. Se ha marcado para revisión.");
-            Player owner = Bukkit.getPlayer(UUID.fromString(ownerUuid));
-            if (owner != null) message(owner, "&cUn alquiler ha caducado pero requiere revisión administrativa; no se ha duplicado el objeto.");
-            return;
-        }
-        // Guardar el objeto real que vuelve, no la copia original del anuncio.
-        ItemMeta meta = found.getItemMeta();
-        if (meta != null) { meta.getPersistentDataContainer().remove(rentalKey); found.setItemMeta(meta); }
-        byte[] data;
-        try { data = serializeItem(found); }
-        catch (IOException e) { markRentalExpiredRecovery(rentalId, listingId, "No se pudo serializar el objeto al caducar: " + e.getMessage()); return; }
+    }
 
+    private void processExpiredRental(String rentalId, String listingId, UUID renterUuid, UUID ownerUuid) {
+        Player renterOnline = Bukkit.getPlayer(renterUuid);
+        if (renterOnline != null) {
+            // El jugador está conectado: buscar el objeto en su inventario exacto
+            List<Integer> matches = new ArrayList<>();
+            ItemStack found = null;
+            ItemStack[] contents = renterOnline.getInventory().getContents();
+            for (int i = 0; i < contents.length; i++) {
+                ItemStack stack = contents[i];
+                if (hasRentalId(stack, rentalId)) {
+                    matches.add(i);
+                    found = stack.clone();
+                }
+            }
+
+            if (matches.size() == 1 && found != null) {
+                ItemMeta meta = found.getItemMeta();
+                if (meta != null) {
+                    meta.getPersistentDataContainer().remove(rentalKey);
+                    found.setItemMeta(meta);
+                }
+                try {
+                    byte[] data = serializeItem(found);
+                    database.setAutoCommit(false);
+                    try (PreparedStatement ps = database.prepareStatement("INSERT INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+                        ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid.toString()); ps.setString(4, renterUuid.toString()); ps.setBytes(5, data); ps.setLong(6, System.currentTimeMillis()); ps.executeUpdate();
+                    }
+                    try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
+                        ps.setString(1, rentalId); ps.executeUpdate();
+                    }
+                    try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=?,version=version+1 WHERE id=? AND status='RENTED'")) {
+                        ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate();
+                    }
+                    database.commit(); database.setAutoCommit(true);
+
+                    renterOnline.getInventory().setItem(matches.get(0), null);
+                    renterOnline.updateInventory();
+                    message(renterOnline, "&eTu alquiler ha caducado y el objeto ha sido retirado.");
+                    Player ownerOnline = Bukkit.getPlayer(ownerUuid);
+                    if (ownerOnline != null) {
+                        message(ownerOnline, "&aTu objeto ha vuelto por caducidad. Recógelo en Mis devoluciones.");
+                    }
+                } catch (Exception e) {
+                    try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+                }
+                return;
+            } else if (matches.size() > 1) {
+                markRentalExpiredRecovery(rentalId, listingId, "Duplicidad detectada al caducar en línea.");
+                return;
+            }
+        }
+
+        // Jugador desconectado o no encontrado en inventario físico directo: procesar devolución de forma segura desde los datos originales del anuncio/respaldo
         try {
-            database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("INSERT INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
-                ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid); ps.setString(4, renter.getUniqueId().toString()); ps.setBytes(5, data); ps.setLong(6, System.currentTimeMillis()); ps.executeUpdate();
+            ItemStack fallbackItem = null;
+            try (PreparedStatement ps = database.prepareStatement("SELECT item_data FROM listings WHERE id=?")) {
+                ps.setString(1, listingId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) fallbackItem = deserializeItem(rs.getBytes("item_data"));
+                }
             }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) { ps.setString(1, rentalId); if (ps.executeUpdate() != 1) { database.rollback(); database.setAutoCommit(true); return; } }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=?,version=version+1 WHERE id=? AND status='RENTED'")) { ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate(); }
+            if (fallbackItem == null) return;
+
+            ItemMeta meta = fallbackItem.getItemMeta();
+            if (meta != null) {
+                meta.getPersistentDataContainer().remove(rentalKey);
+                fallbackItem.setItemMeta(meta);
+            }
+            byte[] data = serializeItem(fallbackItem);
+
+            database.setAutoCommit(false);
+            try (PreparedStatement ps = database.prepareStatement("INSERT OR IGNORE INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+                ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid.toString()); ps.setString(4, renterUuid.toString()); ps.setBytes(5, data); ps.setLong(6, System.currentTimeMillis()); ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
+                ps.setString(1, rentalId); ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=?,version=version+1 WHERE id=? AND status='RENTED'")) {
+                ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate();
+            }
             database.commit(); database.setAutoCommit(true);
-            // DB guarda la devolución antes de retirar el objeto del inventario. Una caída exacta aquí puede requerir revisión manual.
-            renter.getInventory().setItem(matches.get(0), null);
-            renter.updateInventory();
-            message(renter, "&eTu alquiler ha caducado y el objeto ha sido retirado.");
-            Player owner = Bukkit.getPlayer(UUID.fromString(ownerUuid));
-            if (owner != null) message(owner, "&aTu objeto está disponible en &e/prestamos &a> Mis devoluciones.");
+
+            // Si el jugador está conectado, barremos cualquier rastro obsoleto del item en su inventario para evitar que se lo quede
+            if (renterOnline != null) {
+                for (int i = 0; i < renterOnline.getInventory().getContents().length; i++) {
+                    if (hasRentalId(renterOnline.getInventory().getItem(i), rentalId)) {
+                        renterOnline.getInventory().setItem(i, null);
+                    }
+                }
+                renterOnline.updateInventory();
+                message(renterOnline, "&eUn alquiler tuyo ha caducado estando desconectado y el objeto ha sido devuelto.");
+            }
+            Player ownerOnline = Bukkit.getPlayer(ownerUuid);
+            if (ownerOnline != null) {
+                message(ownerOnline, "&aTu objeto ha vuelto por caducidad (offline). Recógelo en Mis devoluciones.");
+            }
         } catch (Exception e) {
             try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-            markRentalExpiredRecovery(rentalId, listingId, "Error creando devolución: " + e.getMessage());
-            getLogger().severe("Error procesando devolución " + rentalId + ": " + e.getMessage());
-            message(renter, "&cHa habido un error al devolver el objeto. Se ha marcado para revisión.");
+            getLogger().warning("Error procesando caducidad offline para " + rentalId + ": " + e.getMessage());
         }
     }
 
@@ -698,11 +881,10 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
             database.setAutoCommit(false);
             try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RECOVERY_REQUIRED' WHERE id=?")) { ps.setString(1, rentalId); ps.executeUpdate(); }
             try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RECOVERY_REQUIRED',updated_at=? WHERE id=?")) { ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate(); }
-            try (PreparedStatement ps = database.prepareStatement("INSERT INTO operations(id,operation_type,listing_id,player_uuid,status,details,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)")) {
-                long now = System.currentTimeMillis(); ps.setString(1, UUID.randomUUID().toString()); ps.setString(2, "EXPIRE"); ps.setString(3, listingId); ps.setString(4, "system"); ps.setString(5, "RECOVERY_REQUIRED"); ps.setString(6, details); ps.setLong(7, now); ps.setLong(8, now); ps.executeUpdate();
-            }
             database.commit(); database.setAutoCommit(true);
-        } catch (SQLException e) { getLogger().severe("No se pudo registrar devolución para revisión: " + e.getMessage()); try { database.setAutoCommit(true); } catch (Exception ignored) {} }
+        } catch (SQLException ignored) {
+            try { database.setAutoCommit(true); } catch (Exception ex2) {}
+        }
     }
 
     private boolean hasRentalId(ItemStack item, String rentalId) {
@@ -721,7 +903,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
         String title = event.getView().getTitle();
         boolean ourMenu = title.equals(color(MENU_TITLE)) || title.equals(color(MARKET_TITLE)) || title.equals(color(LISTINGS_TITLE)) || title.equals(color(CONFIRM_TITLE)) || title.equals(color(RENTALS_TITLE)) || title.equals(color(RETURNS_TITLE));
         if (!ourMenu) {
-            // No permitir mover objetos alquilados hacia cofres u otros inventarios.
             if (hasRentalMarker(event.getCurrentItem()) || hasRentalMarker(event.getCursor())) {
                 if (event.getClickedInventory() != null && event.getClickedInventory() != event.getView().getBottomInventory()) event.setCancelled(true);
                 if (event.isShiftClick() || event.getHotbarButton() >= 0) event.setCancelled(true);
@@ -745,12 +926,20 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
                 case "back_market" -> openListings(player, false);
                 case "confirm_rental" -> {
                     String id = pendingListings.get(player.getUniqueId());
-                    if (id == null) message(player, "&cLa confirmación ha caducado. Abre el anuncio de nuevo.");
+                    if (id == null) message(player, "&cLa confirmación ha caducado.");
                     else { pendingListings.remove(player.getUniqueId()); player.closeInventory(); rentListing(player, id); }
                 }
                 case "claim_return" -> {
                     String id = meta.getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
                     if (id != null) { player.closeInventory(); claimReturn(player, id); }
+                }
+                case "cancel_listing" -> {
+                    String id = meta.getPersistentDataContainer().get(listingKey, PersistentDataType.STRING);
+                    if (id != null) { player.closeInventory(); cancelListing(player, id); }
+                }
+                case "return_early_gui" -> {
+                    String id = meta.getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+                    if (id != null) { player.closeInventory(); returnEarly(player, id); }
                 }
             }
             return;
@@ -779,7 +968,9 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
-        Bukkit.getScheduler().runTask(this, () -> expirePlayerRentals(event.getPlayer()));
+        Bukkit.getScheduler().runTask(this, () -> {
+            processAllExpiredRentals();
+        });
     }
 
     @EventHandler
@@ -809,9 +1000,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
     @EventHandler
     public void onPickup(EntityPickupItemEvent event) {
         if (hasRentalMarker(event.getItem().getItemStack()) && event.getEntity() instanceof Player player) {
-            // Un objeto marcado no debería estar en el suelo; evitar que cambie de dueño.
             event.setCancelled(true);
-            message(player, "&cEste objeto alquilado no se puede recoger del suelo. Contacta con un administrador.");
         }
     }
 
@@ -819,13 +1008,34 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
     public void onDeath(PlayerDeathEvent event) {
         Player player = event.getEntity();
         List<ItemStack> rentalDrops = new ArrayList<>();
-        for (ItemStack drop : new ArrayList<>(event.getDrops())) if (hasRentalMarker(drop)) rentalDrops.add(drop.clone());
+        
+        // Comprobar tanto drops normales como inventario completo (cubre keepInventory y /kill sin drops)
+        for (ItemStack drop : event.getDrops()) {
+            if (hasRentalMarker(drop)) rentalDrops.add(drop.clone());
+        }
+        for (ItemStack content : player.getInventory().getContents()) {
+            if (hasRentalMarker(content) && !rentalDrops.contains(content)) {
+                rentalDrops.add(content.clone());
+            }
+        }
+
         if (rentalDrops.isEmpty()) return;
-        // La muerte devuelve anticipadamente el objeto para que no quede perdido en el suelo.
+
         for (ItemStack drop : rentalDrops) {
-            String rentalId = drop.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
-            if (rentalId != null) returnRentalOnDeath(player, rentalId, drop);
-            event.getDrops().removeIf(d -> hasRentalMarker(d) && rentalId != null && rentalId.equals(d.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING)));
+            ItemMeta meta = drop.getItemMeta();
+            if (meta == null) continue;
+            String rentalId = meta.getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+            if (rentalId != null) {
+                returnRentalOnDeath(player, rentalId, drop);
+            }
+        }
+
+        // Limpiar los objetos alquilados del inventario o drops del jugador para que no se dupliquen ni se pierdan
+        event.getDrops().removeIf(this::hasRentalMarker);
+        for (int i = 0; i < player.getInventory().getContents().length; i++) {
+            if (hasRentalMarker(player.getInventory().getItem(i))) {
+                player.getInventory().setItem(i, null);
+            }
         }
     }
 
@@ -833,18 +1043,37 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener {
         String listingId; String ownerUuid;
         try (PreparedStatement ps = database.prepareStatement("SELECT listing_id,owner_uuid FROM rentals WHERE id=? AND renter_uuid=? AND status='ACTIVE'")) {
             ps.setString(1, rentalId); ps.setString(2, renter.getUniqueId().toString());
-            try (ResultSet rs = ps.executeQuery()) { if (!rs.next()) return; listingId = rs.getString("listing_id"); ownerUuid = rs.getString("owner_uuid"); }
+            try (ResultSet rs = ps.executeQuery()) {
+                if (!rs.next()) return;
+                listingId = rs.getString("listing_id"); ownerUuid = rs.getString("owner_uuid");
+            }
         } catch (SQLException e) { return; }
         try {
-            ItemMeta meta = item.getItemMeta(); if (meta != null) { meta.getPersistentDataContainer().remove(rentalKey); item.setItemMeta(meta); }
-            byte[] data = serializeItem(item); long now = System.currentTimeMillis();
+            ItemMeta meta = item.getItemMeta();
+            if (meta != null) {
+                meta.getPersistentDataContainer().remove(rentalKey);
+                meta.getPersistentDataContainer().remove(actionKey);
+                item.setItemMeta(meta);
+            }
+            byte[] data = serializeItem(item);
+            long now = System.currentTimeMillis();
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("INSERT OR IGNORE INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?,'PENDING')")) { ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid); ps.setString(4, renter.getUniqueId().toString()); ps.setBytes(5, data); ps.setLong(6, now); ps.executeUpdate(); }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) { ps.setString(1, rentalId); ps.executeUpdate(); }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=? WHERE id=? AND status='RENTED'")) { ps.setLong(1, now); ps.setString(2, listingId); ps.executeUpdate(); }
+            try (PreparedStatement ps = database.prepareStatement("INSERT OR IGNORE INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+                ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid); ps.setString(4, renter.getUniqueId().toString()); ps.setBytes(5, data); ps.setLong(6, now); ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
+                ps.setString(1, rentalId); ps.executeUpdate();
+            }
+            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=? WHERE id=? AND status='RENTED'")) {
+                ps.setLong(1, now); ps.setString(2, listingId); ps.executeUpdate();
+            }
             database.commit(); database.setAutoCommit(true);
-            Player owner = Bukkit.getPlayer(UUID.fromString(ownerUuid)); if (owner != null) message(owner, "&aUn objeto alquilado ha vuelto anticipadamente tras la muerte del jugador. Recógelo en Mis devoluciones.");
-        } catch (Exception e) { try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {} getLogger().warning("Error devolviendo objeto tras muerte: " + e.getMessage()); }
+            Player owner = Bukkit.getPlayer(UUID.fromString(ownerUuid));
+            if (owner != null) message(owner, "&aUn objeto alquilado ha vuelto tras la muerte del jugador. Recógelo en Mis devoluciones.");
+        } catch (Exception e) {
+            try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
+            getLogger().warning("Error devolviendo objeto tras muerte: " + e.getMessage());
+        }
     }
 
     private String formatDuration(long seconds) {
