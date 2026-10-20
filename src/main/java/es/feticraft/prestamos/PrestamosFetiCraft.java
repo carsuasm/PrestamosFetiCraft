@@ -777,7 +777,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
     private void processExpiredRental(String rentalId, String listingId, UUID renterUuid, UUID ownerUuid) {
         Player renterOnline = Bukkit.getPlayer(renterUuid);
         if (renterOnline != null) {
-            // El jugador está conectado: buscar el objeto en su inventario exacto
             List<Integer> matches = new ArrayList<>();
             ItemStack found = null;
             ItemStack[] contents = renterOnline.getInventory().getContents();
@@ -826,7 +825,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             }
         }
 
-        // Jugador desconectado o no encontrado en inventario físico directo: procesar devolución de forma segura desde los datos originales del anuncio/respaldo
         try {
             ItemStack fallbackItem = null;
             try (PreparedStatement ps = database.prepareStatement("SELECT item_data FROM listings WHERE id=?")) {
@@ -856,16 +854,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             }
             database.commit(); database.setAutoCommit(true);
 
-            // Si el jugador está conectado, barremos cualquier rastro obsoleto del item en su inventario para evitar que se lo quede
-            if (renterOnline != null) {
-                for (int i = 0; i < renterOnline.getInventory().getContents().length; i++) {
-                    if (hasRentalId(renterOnline.getInventory().getItem(i), rentalId)) {
-                        renterOnline.getInventory().setItem(i, null);
-                    }
-                }
-                renterOnline.updateInventory();
-                message(renterOnline, "&eUn alquiler tuyo ha caducado estando desconectado y el objeto ha sido devuelto.");
-            }
             Player ownerOnline = Bukkit.getPlayer(ownerUuid);
             if (ownerOnline != null) {
                 message(ownerOnline, "&aTu objeto ha vuelto por caducidad (offline). Recógelo en Mis devoluciones.");
@@ -968,8 +956,33 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
 
     @EventHandler
     public void onJoin(PlayerJoinEvent event) {
+        Player player = event.getPlayer();
         Bukkit.getScheduler().runTask(this, () -> {
             processAllExpiredRentals();
+            
+            // Limpieza automática al entrar: si el jugador tenía un objeto cuyo alquiler expiró offline, se le retira de las manos/inventario
+            ItemStack[] contents = player.getInventory().getContents();
+            for (int i = 0; i < contents.length; i++) {
+                ItemStack stack = contents[i];
+                if (stack != null && stack.hasItemMeta()) {
+                    String rId = stack.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+                    if (rId != null) {
+                        try (PreparedStatement ps = database.prepareStatement("SELECT status FROM rentals WHERE id=?")) {
+                            ps.setString(1, rId);
+                            try (ResultSet rs = ps.executeQuery()) {
+                                if (rs.next()) {
+                                    String status = rs.getString("status");
+                                    if (!"ACTIVE".equals(status)) {
+                                        player.getInventory().setItem(i, null);
+                                        message(player, "&cSe ha retirado un objeto alquilado que ya había caducado.");
+                                    }
+                                }
+                            }
+                        } catch (Exception ignored) {}
+                    }
+                }
+            }
+            player.updateInventory();
         });
     }
 
@@ -1009,7 +1022,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         Player player = event.getEntity();
         List<ItemStack> rentalDrops = new ArrayList<>();
         
-        // Comprobar tanto drops normales como inventario completo (cubre keepInventory y /kill sin drops)
         for (ItemStack drop : event.getDrops()) {
             if (hasRentalMarker(drop)) rentalDrops.add(drop.clone());
         }
@@ -1030,7 +1042,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             }
         }
 
-        // Limpiar los objetos alquilados del inventario o drops del jugador para que no se dupliquen ni se pierdan
         event.getDrops().removeIf(this::hasRentalMarker);
         for (int i = 0; i < player.getInventory().getContents().length; i++) {
             if (hasRentalMarker(player.getInventory().getItem(i))) {
