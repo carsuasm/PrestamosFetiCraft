@@ -12,6 +12,7 @@ import org.bukkit.entity.Player;
 import org.bukkit.event.EventHandler;
 import org.bukkit.event.Listener;
 import org.bukkit.event.inventory.InventoryClickEvent;
+import org.bukkit.event.inventory.InventoryCloseEvent;
 import org.bukkit.event.inventory.InventoryDragEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
@@ -33,7 +34,9 @@ import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 public final class PrestamosFetiCraft extends JavaPlugin
@@ -41,16 +44,21 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
     private Economy economy;
     private NamespacedKey actionKey;
+    private NamespacedKey listingKey;
     private Connection database;
+
+    private final Map<UUID, String> pendingListings = new HashMap<>();
 
     private static final String MENU_TITLE = "&8Préstamos de FetiCraft";
     private static final String MARKET_TITLE = "&8Mercado de préstamos";
     private static final String LISTINGS_TITLE = "&8Mis anuncios";
+    private static final String CONFIRM_TITLE = "&8Confirmar alquiler";
     private static final long MAX_DURATION_MINUTES = 43200;
 
     @Override
     public void onEnable() {
         actionKey = new NamespacedKey(this, "menu_action");
+        listingKey = new NamespacedKey(this, "listing_id");
 
         if (!setupEconomy()) {
             getLogger().severe("No se ha encontrado la economía de Vault.");
@@ -79,9 +87,9 @@ public final class PrestamosFetiCraft extends JavaPlugin
         getLogger().info("Préstamos de FetiCraft iniciado correctamente.");
         getLogger().info("Economía conectada: " + economy.getName());
         getLogger().info("Base de datos SQLite inicializada correctamente.");
-        getLogger().info("Mercado y consulta de anuncios habilitados.");
+        getLogger().info("Mercado, anuncios y confirmación visual habilitados.");
         getLogger().warning(
-                "Los alquileres, las devoluciones y la recuperación automática aún no están implementados."
+                "Los alquileres reales, cobros, devoluciones y recuperación automática aún no están implementados."
         );
     }
 
@@ -495,7 +503,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
     private ItemStack deserializeItem(byte[] data)
             throws IOException, ClassNotFoundException {
         try (ByteArrayInputStream bytes = new ByteArrayInputStream(data);
-             BukkitObjectInputStream input = new BukkitObjectInputStream(bytes)) {
+             BukkitObjectInputStream input =
+                     new BukkitObjectInputStream(bytes)) {
             Object object = input.readObject();
 
             if (!(object instanceof ItemStack item)) {
@@ -717,9 +726,19 @@ public final class PrestamosFetiCraft extends JavaPlugin
                         lore.add(color("&8ID: " + id));
 
                         if ("AVAILABLE".equals(status)) {
-                            lore.add(color("&aDisponible en el mercado"));
+                            lore.add(color("&aPulsa para ver la confirmación"));
                         } else {
                             lore.add(color("&eNo disponible para alquilar"));
+                        }
+
+                        // Solo los anuncios disponibles del Mercado
+                        // reciben el identificador interactivo.
+                        if (!ownListings && "AVAILABLE".equals(status)) {
+                            meta.getPersistentDataContainer().set(
+                                    listingKey,
+                                    PersistentDataType.STRING,
+                                    id
+                            );
                         }
 
                         meta.setLore(lore);
@@ -774,6 +793,116 @@ public final class PrestamosFetiCraft extends JavaPlugin
         player.openInventory(inventory);
     }
 
+    private void openRentalConfirmation(Player player, String listingId) {
+        if (database == null) {
+            player.sendMessage(color("&cLa base de datos no está disponible."));
+            return;
+        }
+
+        String owner;
+        double price;
+        long duration;
+        byte[] itemData;
+
+        // Volvemos a comprobar el estado del anuncio antes de mostrar
+        // la confirmación. Esta pantalla todavía no crea un alquiler.
+        try (PreparedStatement statement = database.prepareStatement("""
+                SELECT owner_uuid, owner_name, item_data, price,
+                       duration_seconds
+                FROM listings
+                WHERE id = ? AND status = 'AVAILABLE'
+                """)) {
+            statement.setString(1, listingId);
+
+            try (ResultSet result = statement.executeQuery()) {
+                if (!result.next()) {
+                    player.sendMessage(color(
+                            "&cEste anuncio ya no está disponible."
+                    ));
+                    openListings(player, false);
+                    return;
+                }
+
+                String ownerUuid = result.getString("owner_uuid");
+
+                if (player.getUniqueId().toString().equals(ownerUuid)) {
+                    player.sendMessage(color(
+                            "&cNo puedes alquilar tu propio objeto."
+                    ));
+                    return;
+                }
+
+                owner = result.getString("owner_name");
+                price = result.getDouble("price");
+                duration = result.getLong("duration_seconds");
+                itemData = result.getBytes("item_data");
+            }
+        } catch (SQLException exception) {
+            getLogger().severe(
+                    "Error preparando la confirmación del anuncio "
+                            + listingId + ": " + exception.getMessage()
+            );
+            player.sendMessage(color(
+                    "&cNo se pudo consultar el anuncio."
+            ));
+            return;
+        }
+
+        ItemStack displayedItem;
+
+        try {
+            displayedItem = deserializeItem(itemData);
+        } catch (IOException | ClassNotFoundException exception) {
+            getLogger().warning(
+                    "No se pudo leer el objeto del anuncio " + listingId
+                            + ": " + exception.getMessage()
+            );
+            player.sendMessage(color(
+                    "&cNo se pudo cargar el objeto. Se necesita una revisión."
+            ));
+            return;
+        }
+
+        Inventory inventory = Bukkit.createInventory(
+                null, 27, color(CONFIRM_TITLE)
+        );
+
+        ItemMeta displayedMeta = displayedItem.getItemMeta();
+
+        if (displayedMeta != null) {
+            List<String> lore = displayedMeta.getLore() == null
+                    ? new ArrayList<>()
+                    : new ArrayList<>(displayedMeta.getLore());
+
+            lore.add(color("&8----------------"));
+            lore.add(color("&7Propietario: &f" + owner));
+            lore.add(color("&7Precio anunciado: &e" + price + " monedas"));
+            lore.add(color("&7Duración: &f" + (duration / 60) + " minutos"));
+            lore.add(color("&eRevisa los datos antes de continuar."));
+            displayedMeta.setLore(lore);
+            displayedItem.setItemMeta(displayedMeta);
+        }
+
+        inventory.setItem(13, displayedItem);
+
+        addButton(
+                inventory, 11, Material.LIME_CONCRETE,
+                "&aConfirmar",
+                "Confirmación de prueba: no cobra ni entrega objetos.",
+                "confirm_rental"
+        );
+
+        addButton(
+                inventory, 15, Material.ARROW,
+                "&cVolver",
+                "Regresar al Mercado.",
+                "back_market"
+        );
+
+        pendingListings.put(player.getUniqueId(), listingId);
+        player.openInventory(inventory);
+    }
+
     @EventHandler
     public void onMenuClick(InventoryClickEvent event) {
         String title = ChatColor.stripColor(event.getView().getTitle());
@@ -781,11 +910,14 @@ public final class PrestamosFetiCraft extends JavaPlugin
         boolean mainMenu = "Préstamos de FetiCraft".equals(title);
         boolean marketMenu = "Mercado de préstamos".equals(title);
         boolean listingsMenu = "Mis anuncios".equals(title);
+        boolean confirmationMenu = "Confirmar alquiler".equals(title);
 
-        if (!mainMenu && !marketMenu && !listingsMenu) {
+        if (!mainMenu && !marketMenu && !listingsMenu
+                && !confirmationMenu) {
             return;
         }
 
+        // Evita mover objetos dentro de estos menús o hacia ellos.
         event.setCancelled(true);
 
         if (!(event.getWhoClicked() instanceof Player player)) {
@@ -794,7 +926,8 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
         int slot = event.getRawSlot();
 
-        if (slot < 0 || slot >= event.getView().getTopInventory().getSize()) {
+        if (slot < 0
+                || slot >= event.getView().getTopInventory().getSize()) {
             return;
         }
 
@@ -804,20 +937,77 @@ public final class PrestamosFetiCraft extends JavaPlugin
             return;
         }
 
+        ItemMeta clickedMeta = clicked.getItemMeta();
+
+        if (clickedMeta == null) {
+            return;
+        }
+
+        String action = clickedMeta.getPersistentDataContainer().get(
+                actionKey,
+                PersistentDataType.STRING
+        );
+
+        // Pantalla de confirmación.
+        if (confirmationMenu) {
+            if ("back_market".equals(action)) {
+                pendingListings.remove(player.getUniqueId());
+                openListings(player, false);
+                return;
+            }
+
+            if ("confirm_rental".equals(action)) {
+                String listingId = pendingListings.remove(
+                        player.getUniqueId()
+                );
+
+                if (listingId == null) {
+                    player.sendMessage(color(
+                            "&cNo se ha encontrado el anuncio seleccionado."
+                    ));
+                    return;
+                }
+
+                // Esta acción es deliberadamente solo visual:
+                // no modifica la base de datos ni el saldo del jugador.
+                player.sendMessage(color(
+                        "&eConfirmación recibida. El alquiler aún no está activado."
+                ));
+                player.sendMessage(color(
+                        "&7No se ha cobrado dinero ni se ha entregado ningún objeto."
+                ));
+                player.sendMessage(color(
+                        "&7ID del anuncio: &f" + listingId
+                ));
+
+                player.closeInventory();
+                return;
+            }
+
+            return;
+        }
+
         if ((marketMenu || listingsMenu) && slot == 49) {
             openMainMenu(player);
             return;
         }
 
-        if (!mainMenu) {
+        // Al pulsar un anuncio disponible del Mercado,
+        // abrimos su pantalla de confirmación.
+        if (marketMenu) {
+            String listingId = clickedMeta.getPersistentDataContainer().get(
+                    listingKey,
+                    PersistentDataType.STRING
+            );
+
+            if (listingId != null) {
+                openRentalConfirmation(player, listingId);
+            }
+
             return;
         }
 
-        String action = clicked.getItemMeta()
-                .getPersistentDataContainer()
-                .get(actionKey, PersistentDataType.STRING);
-
-        if (action == null) {
+        if (!mainMenu || action == null) {
             return;
         }
 
@@ -844,8 +1034,18 @@ public final class PrestamosFetiCraft extends JavaPlugin
 
         if ("Préstamos de FetiCraft".equals(title)
                 || "Mercado de préstamos".equals(title)
-                || "Mis anuncios".equals(title)) {
+                || "Mis anuncios".equals(title)
+                || "Confirmar alquiler".equals(title)) {
             event.setCancelled(true);
+        }
+    }
+
+    @EventHandler
+    public void onMenuClose(InventoryCloseEvent event) {
+        String title = ChatColor.stripColor(event.getView().getTitle());
+
+        if ("Confirmar alquiler".equals(title)) {
+            pendingListings.remove(event.getPlayer().getUniqueId());
         }
     }
 
