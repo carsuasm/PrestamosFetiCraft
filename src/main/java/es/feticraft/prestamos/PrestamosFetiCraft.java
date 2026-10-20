@@ -167,6 +167,20 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             message(player, "&cDebes tener en la mano el objeto que quieres publicar.");
             return;
         }
+        
+        // CONTROL DE SEGURIDAD: Impedir publicar objetos alquilados
+        if (hasRentalMarker(hand)) {
+            String rId = hand.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+            if (isRentalExpiredInDatabase(rId)) {
+                hand.setAmount(0);
+                player.updateInventory();
+                message(player, "&cEl objeto alquilado que sostenías ya había caducado y ha sido retirado.");
+            } else {
+                message(player, "&cNo puedes vender o publicar un objeto que estás alquilando.");
+            }
+            return;
+        }
+
         ItemStack stored = hand.clone();
         String listingId = UUID.randomUUID().toString();
         String operationId = UUID.randomUUID().toString();
@@ -801,10 +815,10 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             byte[] data = serializeItem(fallbackItem);
 
             database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("INSERT OR IGNORE INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
+            try (PreparedStatement ps = database.prepareStatement("INSERT INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
                 ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid.toString()); ps.setString(4, renterUuid.toString()); ps.setBytes(5, data); ps.setLong(6, System.currentTimeMillis()); ps.executeUpdate();
             }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='EXPIRED' WHERE id=? AND status='ACTIVE'")) {
                 ps.setString(1, rentalId); ps.executeUpdate();
             }
             try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=?,version=version+1 WHERE id=? AND status='RENTED'")) {
@@ -820,7 +834,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
                     }
                 }
                 renterOnline.updateInventory();
-                message(renterOnline, "&eTu alquiler ha caducado y el objeto ha sido retirado.");
+                message(renterOnline, "&c¡Tu alquiler ha caducado! El objeto ha sido devuelto al propietario.");
             }
 
             Player ownerOnline = Bukkit.getPlayer(ownerUuid);
@@ -833,15 +847,18 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         }
     }
 
-    private void markRentalExpiredRecovery(String rentalId, String listingId, String details) {
-        try {
-            database.setAutoCommit(false);
-            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RECOVERY_REQUIRED' WHERE id=?")) { ps.setString(1, rentalId); ps.executeUpdate(); }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RECOVERY_REQUIRED',updated_at=? WHERE id=?")) { ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate(); }
-            database.commit(); database.setAutoCommit(true);
-        } catch (SQLException ignored) {
-            try { database.setAutoCommit(true); } catch (Exception ex2) {}
-        }
+    private boolean isRentalExpiredInDatabase(String rentalId) {
+        if (rentalId == null) return false;
+        try (PreparedStatement ps = database.prepareStatement("SELECT status FROM rentals WHERE id=?")) {
+            ps.setString(1, rentalId);
+            try (ResultSet rs = ps.executeQuery()) {
+                if (rs.next()) {
+                    String status = rs.getString("status");
+                    return "EXPIRED".equals(status) || "RETURN_PENDING".equals(status) || "RETURNED".equals(status) || "RECOVERY_REQUIRED".equals(status);
+                }
+            }
+        } catch (Exception ignored) {}
+        return true;
     }
 
     private boolean hasRentalId(ItemStack item, String rentalId) {
@@ -855,8 +872,12 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
     }
 
     @EventHandler
-    public void onMenuClick(InventoryClickEvent event) {
+    public void onInventoryClick(InventoryClickEvent event) {
         if (!(event.getWhoClicked() instanceof Player player)) return;
+        
+        checkAndDestroyExpiredItem(player, event.getCurrentItem(), event);
+        checkAndDestroyExpiredItem(player, event.getCursor(), event);
+
         String title = event.getView().getTitle();
         boolean ourMenu = title.equals(color(MENU_TITLE)) || title.equals(color(MARKET_TITLE)) || title.equals(color(LISTINGS_TITLE)) || title.equals(color(CONFIRM_TITLE)) || title.equals(color(RENTALS_TITLE)) || title.equals(color(RETURNS_TITLE));
         if (!ourMenu) {
@@ -907,6 +928,17 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         }
     }
 
+    private void checkAndDestroyExpiredItem(Player player, ItemStack item, InventoryClickEvent event) {
+        if (item == null || !item.hasItemMeta()) return;
+        String rId = item.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
+        if (rId != null && isRentalExpiredInDatabase(rId)) {
+            item.setAmount(0);
+            event.setCancelled(true);
+            player.updateInventory();
+            message(player, "&cEste objeto alquilado ya caducado ha sido eliminado de tu inventario.");
+        }
+    }
+
     @EventHandler
     public void onMenuDrag(InventoryDragEvent event) {
         String title = event.getView().getTitle();
@@ -934,21 +966,9 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
                 ItemStack stack = contents[i];
                 if (stack != null && stack.hasItemMeta()) {
                     String rId = stack.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
-                    if (rId != null) {
-                        try (PreparedStatement ps = database.prepareStatement("SELECT status FROM rentals WHERE id=?")) {
-                            ps.setString(1, rId);
-                            try (ResultSet rs = ps.executeQuery()) {
-                                if (rs.next()) {
-                                    String status = rs.getString("status");
-                                    if (!"ACTIVE".equals(status)) {
-                                        player.getInventory().setItem(i, null);
-                                        message(player, "&cSe ha retirado un objeto alquilado que ya había caducado.");
-                                    }
-                                } else {
-                                    player.getInventory().setItem(i, null);
-                                }
-                            }
-                        } catch (Exception ignored) {}
+                    if (rId != null && isRentalExpiredInDatabase(rId)) {
+                        player.getInventory().setItem(i, null);
+                        message(player, "&cSe ha retirado un objeto alquilado caducado.");
                     }
                 }
             }
@@ -958,7 +978,13 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
 
     @EventHandler
     public void onDrop(PlayerDropItemEvent event) {
-        if (hasRentalMarker(event.getItemDrop().getItemStack())) {
+        ItemStack item = event.getItemDrop().getItemStack();
+        String rId = item.hasItemMeta() ? item.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING) : null;
+        if (rId != null && isRentalExpiredInDatabase(rId)) {
+            event.getItemDrop().remove();
+            return;
+        }
+        if (hasRentalMarker(item)) {
             event.setCancelled(true);
             message(event.getPlayer(), "&cNo puedes tirar un objeto alquilado.");
         }
@@ -1007,7 +1033,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             ItemMeta meta = drop.getItemMeta();
             if (meta == null) continue;
             String rentalId = meta.getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
-            if (rentalId != null) {
+            if (rentalId != null && !isRentalExpiredInDatabase(rentalId)) {
                 returnRentalOnDeath(player, rentalId, drop);
             }
         }
@@ -1042,7 +1068,7 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             try (PreparedStatement ps = database.prepareStatement("INSERT OR IGNORE INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
                 ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid); ps.setString(4, renter.getUniqueId().toString()); ps.setBytes(5, data); ps.setLong(6, now); ps.executeUpdate();
             }
-            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
+            try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='EXPIRED' WHERE id=? AND status='ACTIVE'")) {
                 ps.setString(1, rentalId); ps.executeUpdate();
             }
             try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=? WHERE id=? AND status='RENTED'")) {
