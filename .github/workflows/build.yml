@@ -1,0 +1,35 @@
+
+name: Compilar PrestamosFetiCraft
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ "main" ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Descargar el repositorio
+        uses: actions/checkout@v4
+
+      - name: Preparar Java 25
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Compilar con Maven
+        run: mvn --batch-mode clean package
+
+      - name: Guardar el plugin compilado
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrestamosFetiCraft
+          path: target/PrestamosFetiCraft.jar
+          if-no-files-found: error
