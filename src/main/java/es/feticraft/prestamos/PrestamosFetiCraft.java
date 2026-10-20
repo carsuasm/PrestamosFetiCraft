@@ -78,7 +78,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             return;
         }
         getCommand("prestamos").setExecutor(this);
-        // Procesar alquileres caducados cada segundo para jugadores conectados y desconectados (global).
         Bukkit.getScheduler().runTaskTimer(this, this::processAllExpiredRentals, 20L, 20L);
         getLogger().info("Préstamos de FetiCraft iniciado correctamente.");
         getLogger().info("Economía conectada: " + economy.getName());
@@ -775,57 +774,16 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
     }
 
     private void processExpiredRental(String rentalId, String listingId, UUID renterUuid, UUID ownerUuid) {
-        Player renterOnline = Bukkit.getPlayer(renterUuid);
-        if (renterOnline != null) {
-            List<Integer> matches = new ArrayList<>();
-            ItemStack found = null;
-            ItemStack[] contents = renterOnline.getInventory().getContents();
-            for (int i = 0; i < contents.length; i++) {
-                ItemStack stack = contents[i];
-                if (hasRentalId(stack, rentalId)) {
-                    matches.add(i);
-                    found = stack.clone();
-                }
-            }
-
-            if (matches.size() == 1 && found != null) {
-                ItemMeta meta = found.getItemMeta();
-                if (meta != null) {
-                    meta.getPersistentDataContainer().remove(rentalKey);
-                    found.setItemMeta(meta);
-                }
-                try {
-                    byte[] data = serializeItem(found);
-                    database.setAutoCommit(false);
-                    try (PreparedStatement ps = database.prepareStatement("INSERT INTO returns(rental_id,listing_id,owner_uuid,renter_uuid,item_data,created_at,status) VALUES(?,?,?,?,?,?, 'PENDING')")) {
-                        ps.setString(1, rentalId); ps.setString(2, listingId); ps.setString(3, ownerUuid.toString()); ps.setString(4, renterUuid.toString()); ps.setBytes(5, data); ps.setLong(6, System.currentTimeMillis()); ps.executeUpdate();
-                    }
-                    try (PreparedStatement ps = database.prepareStatement("UPDATE rentals SET status='RETURN_PENDING' WHERE id=? AND status='ACTIVE'")) {
-                        ps.setString(1, rentalId); ps.executeUpdate();
-                    }
-                    try (PreparedStatement ps = database.prepareStatement("UPDATE listings SET status='RETURN_PENDING',updated_at=?,version=version+1 WHERE id=? AND status='RENTED'")) {
-                        ps.setLong(1, System.currentTimeMillis()); ps.setString(2, listingId); ps.executeUpdate();
-                    }
-                    database.commit(); database.setAutoCommit(true);
-
-                    renterOnline.getInventory().setItem(matches.get(0), null);
-                    renterOnline.updateInventory();
-                    message(renterOnline, "&eTu alquiler ha caducado y el objeto ha sido retirado.");
-                    Player ownerOnline = Bukkit.getPlayer(ownerUuid);
-                    if (ownerOnline != null) {
-                        message(ownerOnline, "&aTu objeto ha vuelto por caducidad. Recógelo en Mis devoluciones.");
-                    }
-                } catch (Exception e) {
-                    try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-                }
-                return;
-            } else if (matches.size() > 1) {
-                markRentalExpiredRecovery(rentalId, listingId, "Duplicidad detectada al caducar en línea.");
-                return;
-            }
-        }
-
         try {
+            boolean isActive = false;
+            try (PreparedStatement ps = database.prepareStatement("SELECT id FROM rentals WHERE id=? AND status='ACTIVE'")) {
+                ps.setString(1, rentalId);
+                try (ResultSet rs = ps.executeQuery()) {
+                    if (rs.next()) isActive = true;
+                }
+            }
+            if (!isActive) return;
+
             ItemStack fallbackItem = null;
             try (PreparedStatement ps = database.prepareStatement("SELECT item_data FROM listings WHERE id=?")) {
                 ps.setString(1, listingId);
@@ -854,13 +812,24 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
             }
             database.commit(); database.setAutoCommit(true);
 
+            Player renterOnline = Bukkit.getPlayer(renterUuid);
+            if (renterOnline != null) {
+                for (int i = 0; i < renterOnline.getInventory().getContents().length; i++) {
+                    if (hasRentalId(renterOnline.getInventory().getItem(i), rentalId)) {
+                        renterOnline.getInventory().setItem(i, null);
+                    }
+                }
+                renterOnline.updateInventory();
+                message(renterOnline, "&eTu alquiler ha caducado y el objeto ha sido retirado.");
+            }
+
             Player ownerOnline = Bukkit.getPlayer(ownerUuid);
             if (ownerOnline != null) {
-                message(ownerOnline, "&aTu objeto ha vuelto por caducidad (offline). Recógelo en Mis devoluciones.");
+                message(ownerOnline, "&aTu objeto ha vuelto por caducidad. Recógelo en Mis devoluciones.");
             }
         } catch (Exception e) {
             try { database.rollback(); database.setAutoCommit(true); } catch (Exception ignored) {}
-            getLogger().warning("Error procesando caducidad offline para " + rentalId + ": " + e.getMessage());
+            getLogger().warning("Error procesando caducidad para " + rentalId + ": " + e.getMessage());
         }
     }
 
@@ -960,7 +929,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         Bukkit.getScheduler().runTask(this, () -> {
             processAllExpiredRentals();
             
-            // Limpieza automática al entrar: si el jugador tenía un objeto cuyo alquiler expiró offline, se le retira de las manos/inventario
             ItemStack[] contents = player.getInventory().getContents();
             for (int i = 0; i < contents.length; i++) {
                 ItemStack stack = contents[i];
@@ -976,6 +944,8 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
                                         player.getInventory().setItem(i, null);
                                         message(player, "&cSe ha retirado un objeto alquilado que ya había caducado.");
                                     }
+                                } else {
+                                    player.getInventory().setItem(i, null);
                                 }
                             }
                         } catch (Exception ignored) {}
