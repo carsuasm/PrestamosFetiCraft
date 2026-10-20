@@ -26,7 +26,6 @@ import org.bukkit.event.player.PlayerItemConsumeEvent;
 import org.bukkit.event.player.PlayerJoinEvent;
 import org.bukkit.inventory.Inventory;
 import org.bukkit.inventory.ItemStack;
-import org.bukkit.inventory.meta.Damageable;
 import org.bukkit.inventory.meta.ItemMeta;
 import org.bukkit.persistence.PersistentDataType;
 import org.bukkit.plugin.RegisteredServiceProvider;
@@ -1050,11 +1049,9 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         }
     }
 
-    // NUEVO: DETECTAR CUANDO SE ROMPE UN OBJETO ALQUILADO
     @EventHandler
     public void onItemBreak(PlayerItemBreakEvent event) {
-        ItemStack broken = event.getItemsBreak(); // En algunas versiones es event.getItem()
-        // Nota de compatibilidad: Usamos event.getItem() o la revisión segura del item roto
+        ItemStack broken = event.getItem();
         handleItemBreak(event.getPlayer(), broken);
     }
 
@@ -1063,7 +1060,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
         String rentalId = item.getItemMeta().getPersistentDataContainer().get(rentalKey, PersistentDataType.STRING);
         if (rentalId == null) return;
 
-        // Forzar la devolución inmediata a la base de datos como si hubiera expirado
         try {
             String listingId; String ownerUuid;
             try (PreparedStatement ps = database.prepareStatement("SELECT listing_id, owner_uuid FROM rentals WHERE id=? AND renter_uuid=? AND status='ACTIVE'")) {
@@ -1076,7 +1072,6 @@ public final class PrestamosFetiCraft extends JavaPlugin implements Listener, Co
                 }
             }
 
-            // Limpiar marca y clonar item roto (o guardarlo tal cual)
             ItemStack cleanItem = item.clone();
             ItemMeta meta = cleanItem.getItemMeta();
             if (meta != null) {
